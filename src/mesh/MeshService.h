@@ -67,7 +67,7 @@ class MeshService
     void reloadConfig();
 
     /// The owner User record just got updated, update our node DB and broadcast the info into the mesh
-    void reloadOwner();
+    void reloadOwner() { sendOurOwner(); }
 
     /// Called when the user wakes up our GUI, normally sends our latest location to the mesh (if we have it), otherwise at least
     /// sends our owner
@@ -75,6 +75,8 @@ class MeshService
 
     /// Send our owner info to a particular node
     void sendOurOwner(NodeNum dest = NODENUM_BROADCAST, bool wantReplies = false);
+
+    void sendTextMessage();
 
   private:
     /// Broadcasts our last known position

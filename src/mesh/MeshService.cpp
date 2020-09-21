@@ -13,6 +13,7 @@
 #include "main.h"
 #include "mesh-pb-constants.h"
 #include "power.h"
+#include "timing.h"
 
 /*
 receivedPacketQueue - this is a queue of messages we've received from the mesh, which we are keeping to deliver to the phone.
@@ -67,8 +68,8 @@ void MeshService::init()
     sendOwnerPeriod.setup();
     nodeDB.init();
 
-    if (gps)
-        gpsObserver.observe(&gps->newStatus);
+    assert(gps);
+    gpsObserver.observe(&gps->newStatus);
     packetReceivedObserver.observe(&router.notifyPacketReceived);
 }
 
@@ -205,13 +206,6 @@ void MeshService::reloadConfig()
     nodeDB.saveToDisk();
 }
 
-/// The owner User record just got updated, update our node DB and broadcast the info into the mesh
-void MeshService::reloadOwner()
-{
-    sendOurOwner();
-    nodeDB.saveToDisk();
-}
-
 /**
  *  Given a ToRadio buffer parse it and properly handle it (setup radio, owner or send packet into the mesh)
  * Called by PhoneAPI.handleToRadio.  Note: p is a scratch buffer, this function is allowed to write to it but it can not keep a
@@ -298,8 +292,8 @@ int MeshService::onGPSChanged(const meshtastic::GPSStatus *unused)
     p->decoded.which_payload = SubPacket_position_tag;
 
     Position &pos = p->decoded.position;
-
-    if (gps->hasLock()) {
+    // !zero or !zero lat/long means valid
+    if (gps->latitude != 0 || gps->longitude != 0) {
         if (gps->altitude != 0)
             pos.altitude = gps->altitude;
         pos.latitude_i = gps->latitude;
@@ -315,7 +309,7 @@ int MeshService::onGPSChanged(const meshtastic::GPSStatus *unused)
 
     // We limit our GPS broadcasts to a max rate
     static uint32_t lastGpsSend;
-    uint32_t now = millis();
+    uint32_t now = timing::millis();
     if (lastGpsSend == 0 || now - lastGpsSend > radioConfig.preferences.position_broadcast_secs * 1000) {
         lastGpsSend = now;
         DEBUG_MSG("Sending position to mesh\n");
@@ -329,4 +323,24 @@ int MeshService::onGPSChanged(const meshtastic::GPSStatus *unused)
     }
 
     return 0;
+}
+
+void MeshService::sendTextMessage()
+{
+    uint8_t data[] = "AB";
+    
+    //Allocate Mesh packet
+    MeshPacket *p = router.allocForSending();
+    p->decoded.which_payload = SubPacket_data_tag;
+
+    p->decoded.data.typ = Data_Type_CLEAR_TEXT;
+    // p->decoded.data.payload
+    p->decoded.data.payload.size = sizeof(data) - 1;
+    for (int i = 0; i <= sizeof(data) - 1; i++)
+    {
+        p->decoded.data.payload.bytes[i] = data[i];
+    }   
+
+    sendToMesh(p);
+    // router.sendLocal(p);
 }
