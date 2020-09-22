@@ -375,7 +375,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #ifdef CONSOLE_MAX_BAUD
 #define SERIAL_BAUD CONSOLE_MAX_BAUD
 #else
-#define SERIAL_BAUD 921600 // Serial debug baud rate
+#define SERIAL_BAUD 115200 // Serial debug baud rate
 #endif
 
 #include "SerialConsole.h"

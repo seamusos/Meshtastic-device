@@ -72,6 +72,9 @@ bool axp192_found;
 DSRRouter realRouter;
 Router &router = realRouter; // Users of router don't care what sort of subclass implements that API
 
+uint32_t lastTime = 0;
+uint8_t counter = 0;
+
 // -----------------------------------------------------------------------------
 // Application
 // -----------------------------------------------------------------------------
@@ -338,6 +341,7 @@ void setup()
 
     // setBluetoothEnable(false); we now don't start bluetooth until we enter the proper state
     setCPUFast(false); // 80MHz is fine for our slow peripherals
+    
 }
 
 #if 0
@@ -373,6 +377,16 @@ void loop()
 
     concurrency::periodicScheduler.loop();
     // axpDebugOutput.loop();
+
+    /************* Sensor Testing **************/
+    if((millis() - lastTime) >= 1000)
+    {
+        counter++;
+        uint8_t dataString[] = "Hello There";
+        // sprintf(dataString, "Counter = %c", counter);
+        service.sendTextMessage(dataString, sizeof(dataString));
+        lastTime = millis();
+    }
 
 #ifdef DEBUG_PORT
     DEBUG_PORT.loop(); // Send/receive protobufs over the serial port

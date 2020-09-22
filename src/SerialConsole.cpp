@@ -3,7 +3,13 @@
 #include "configuration.h"
 #include <Arduino.h>
 
-#define Port Serial
+
+#define Port Serial2
+// #ifndef ARDUINO_NRF52840_PCA10056
+// #define Port Serial
+// #else 
+// #define Port Serial2
+// #endif
 
 SerialConsole console;
 
