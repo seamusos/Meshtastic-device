@@ -76,7 +76,7 @@ class MeshService
     /// Send our owner info to a particular node
     void sendOurOwner(NodeNum dest = NODENUM_BROADCAST, bool wantReplies = false);
 
-    void sendTextMessage();
+    void sendTextMessage(uint8_t *array, size_t size);
 
   private:
     /// Broadcasts our last known position

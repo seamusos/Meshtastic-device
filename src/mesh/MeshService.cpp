@@ -325,18 +325,18 @@ int MeshService::onGPSChanged(const meshtastic::GPSStatus *unused)
     return 0;
 }
 
-void MeshService::sendTextMessage()
+void MeshService::sendTextMessage(uint8_t *array, size_t size)
 {
-    uint8_t data[] = "AB";
+    // uint8_t data[] = "AB";
     
     //Allocate Mesh packet
     MeshPacket *p = router.allocForSending();
     p->decoded.which_payload = SubPacket_data_tag;
 
-    p->decoded.data.typ = Data_Type_CLEAR_TEXT;
+    p->decoded.data.typ = Data_Type_CLEAR_TEXT; //Modify for different types of data
     // p->decoded.data.payload
-    p->decoded.data.payload.size = sizeof(data) - 1;
-    for (int i = 0; i <= sizeof(data) - 1; i++)
+    p->decoded.data.payload.size = size - 1;
+    for (int i = 0; i <= size - 1; i++)
     {
         p->decoded.data.payload.bytes[i] = data[i];
     }   
