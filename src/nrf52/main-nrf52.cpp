@@ -1,6 +1,6 @@
 #include "NRF52Bluetooth.h"
 #include "configuration.h"
-#include "graphics/TFT.h"
+#include "graphics/TFTDisplay.h"
 #include <assert.h>
 #include <ble_gap.h>
 #include <memory.h>
@@ -49,14 +49,19 @@ void getMacAddr(uint8_t *dmac)
 NRF52Bluetooth *nrf52Bluetooth;
 
 static bool bleOn = false;
+static const bool enableBle = true; // Set to false for easier debugging
+
 void setBluetoothEnable(bool on)
 {
     if (on != bleOn) {
         if (on) {
             if (!nrf52Bluetooth) {
-                // DEBUG_MSG("DISABLING NRF52 BLUETOOTH WHILE DEBUGGING\n");
-                nrf52Bluetooth = new NRF52Bluetooth();
-                nrf52Bluetooth->setup();
+                if (!enableBle)
+                    DEBUG_MSG("DISABLING NRF52 BLUETOOTH WHILE DEBUGGING\n");
+                else {
+                    nrf52Bluetooth = new NRF52Bluetooth();
+                    nrf52Bluetooth->setup();
+                }
             }
         } else {
             DEBUG_MSG("FIXME: implement BLE disable\n");

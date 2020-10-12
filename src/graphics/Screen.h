@@ -10,11 +10,12 @@
 #include <SSD1306Wire.h>
 #endif
 
-#include "TFT.h"
+#include "EInkDisplay.h"
+#include "TFTDisplay.h"
 #include "TypedQueue.h"
 #include "commands.h"
 #include "concurrency/LockGuard.h"
-#include "concurrency/PeriodicTask.h"
+#include "concurrency/OSThread.h"
 #include "power.h"
 #include <string>
 
@@ -46,7 +47,7 @@ class DebugInfo
     /// Renders the debug screen.
     void drawFrame(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y);
     void drawFrameSettings(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y);
-
+    void drawFrameWiFi(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y);
 
     std::string channelName;
 
@@ -61,7 +62,7 @@ class DebugInfo
  *          multiple times simultaneously. All state-changing calls are queued and executed
  *          when the main loop calls us.
  */
-class Screen : public concurrency::PeriodicTask
+class Screen : public concurrency::OSThread
 {
     CallbackObserver<Screen, const meshtastic::Status *> powerStatusObserver =
         CallbackObserver<Screen, const meshtastic::Status *>(this, &Screen::handleStatusUpdate);
@@ -183,7 +184,7 @@ class Screen : public concurrency::PeriodicTask
     /// Updates the UI.
     //
     // Called periodically from the main loop.
-    void doTask() final;
+    int32_t runOnce() final;
 
   private:
     struct ScreenCmd {
@@ -201,7 +202,7 @@ class Screen : public concurrency::PeriodicTask
             return true; // claim success if our display is not in use
         else {
             bool success = cmdQueue.enqueue(cmd, 0);
-            setPeriod(1); // handle ASAP
+            enabled = true; // handle ASAP (we are the registered reader for cmdQueue, but might have been disabled)
             return success;
         }
     }
@@ -220,6 +221,8 @@ class Screen : public concurrency::PeriodicTask
 
     static void drawDebugInfoSettingsTrampoline(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y);
 
+    static void drawDebugInfoWiFiTrampoline(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y);
+
     /// Queue of commands to execute in doTask.
     TypedQueue<ScreenCmd> cmdQueue;
     /// Whether we are using a display
@@ -237,6 +240,8 @@ class Screen : public concurrency::PeriodicTask
     /** FIXME cleanup display abstraction */
 #ifdef ST7735_CS
     TFTDisplay dispdev;
+#elif defined(HAS_EINK)
+    EInkDisplay dispdev;
 #elif defined(USE_SH1106)
     SH1106Wire dispdev;
 #else

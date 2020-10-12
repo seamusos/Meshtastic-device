@@ -62,11 +62,16 @@ class AnalogBatteryLevel : public HasBatteryLevel
     virtual bool isBatteryConnect() { return getBattVoltage() != -1; }
 } analogLevel;
 
+Power::Power() : OSThread("Power") {}
+
 bool Power::analogInit()
 {
 #ifdef BATTERY_PIN
     DEBUG_MSG("Using analog input for battery level\n");
+#ifndef NO_ESP32
+    // ESP32 needs special analog stuff
     adcAttachPin(BATTERY_PIN);
+#endif
     // adcStart(BATTERY_PIN);
     analogReadResolution(10); // Default of 12 is not very linear. Recommended to use 10 or 11 depending on needed resolution.
     batteryLevel = &analogLevel;
@@ -83,10 +88,7 @@ bool Power::setup()
     if (!found) {
         found = analogInit();
     }
-    if (found) {
-        concurrency::PeriodicTask::setup(); // We don't start our periodic task unless we actually found the device
-        setPeriod(1);
-    }
+    enabled = found;
 
     return found;
 }
@@ -119,6 +121,7 @@ void Power::readPowerStatus()
         const PowerStatus powerStatus =
             PowerStatus(hasBattery ? OptTrue : OptFalse, batteryLevel->isVBUSPlug() ? OptTrue : OptFalse,
                         batteryLevel->isChargeing() ? OptTrue : OptFalse, batteryVoltageMv, batteryChargePercent);
+        DEBUG_MSG("Read power stat %d\n", powerStatus.getHasUSB());
         newStatus.notifyObservers(&powerStatus);
 
         // If we have a battery at all and it is less than 10% full, force deep sleep
@@ -131,13 +134,46 @@ void Power::readPowerStatus()
     }
 }
 
-void Power::doTask()
+int32_t Power::runOnce()
 {
     readPowerStatus();
 
+#ifdef PMU_IRQ
+    if (pmu_irq) {
+        pmu_irq = false;
+        axp.readIRQ();
+
+        DEBUG_MSG("pmu irq!\n");
+
+        if (axp.isChargingIRQ()) {
+            DEBUG_MSG("Battery start charging\n");
+        }
+        if (axp.isChargingDoneIRQ()) {
+            DEBUG_MSG("Battery fully charged\n");
+        }
+        if (axp.isVbusRemoveIRQ()) {
+            DEBUG_MSG("USB unplugged\n");
+            powerFSM.trigger(EVENT_POWER_DISCONNECTED);
+        }
+        if (axp.isVbusPlugInIRQ()) {
+            DEBUG_MSG("USB plugged In\n");
+            powerFSM.trigger(EVENT_POWER_CONNECTED);
+        }
+        if (axp.isBattPlugInIRQ()) {
+            DEBUG_MSG("Battery inserted\n");
+        }
+        if (axp.isBattRemoveIRQ()) {
+            DEBUG_MSG("Battery removed\n");
+        }
+        if (axp.isPEKShortPressIRQ()) {
+            DEBUG_MSG("PEK short button press\n");
+        }
+        axp.clearIRQ();
+    }
+#endif
+
     // Only read once every 20 seconds once the power status for the app has been initialized
-    if (statusHandler && statusHandler->isInitialized())
-        setPeriod(1000 * 20);
+    return (statusHandler && statusHandler->isInitialized()) ? (1000 * 20) : RUN_SAME;
 }
 
 /**
@@ -168,7 +204,7 @@ bool Power::axp192Init()
             DEBUG_MSG("----------------------------------------\n");
 
             axp.setPowerOutPut(AXP192_LDO2, AXP202_ON); // LORA radio
-            axp.setPowerOutPut(AXP192_LDO3, AXP202_ON); // GPS main power
+            // axp.setPowerOutPut(AXP192_LDO3, AXP202_ON); // GPS main power - now turned on in setGpsPower
             axp.setPowerOutPut(AXP192_DCDC2, AXP202_ON);
             axp.setPowerOutPut(AXP192_EXTEN, AXP202_ON);
             axp.setPowerOutPut(AXP192_DCDC1, AXP202_ON);
@@ -200,9 +236,11 @@ bool Power::axp192Init()
                 PMU_IRQ, [] { pmu_irq = true; }, FALLING);
 
             axp.adc1Enable(AXP202_BATT_CUR_ADC1, 1);
-            axp.enableIRQ(AXP202_BATT_REMOVED_IRQ | AXP202_BATT_CONNECT_IRQ | AXP202_CHARGING_FINISHED_IRQ | AXP202_CHARGING_IRQ |
-                              AXP202_VBUS_REMOVED_IRQ | AXP202_VBUS_CONNECT_IRQ | AXP202_PEK_SHORTPRESS_IRQ,
-                          1);
+            // we do not look for AXP202_CHARGING_FINISHED_IRQ & AXP202_CHARGING_IRQ because it occurs repeatedly while there is
+            // no battery also it could cause inadvertent waking from light sleep just because the battery filled
+            // we don't look for AXP202_BATT_REMOVED_IRQ because it occurs repeatedly while no battery installed
+            // we don't look at AXP202_VBUS_REMOVED_IRQ because we don't have anything hooked to vbus
+            axp.enableIRQ(AXP202_BATT_CONNECT_IRQ | AXP202_VBUS_CONNECT_IRQ | AXP202_PEK_SHORTPRESS_IRQ, 1);
 
             axp.clearIRQ();
 #endif
@@ -217,43 +255,5 @@ bool Power::axp192Init()
     return axp192_found;
 #else
     return false;
-#endif
-}
-
-void Power::loop()
-{
-#ifdef PMU_IRQ
-    if (pmu_irq) {
-        pmu_irq = false;
-        axp.readIRQ();
-
-        DEBUG_MSG("pmu irq!\n");
-
-        if (axp.isChargingIRQ()) {
-            DEBUG_MSG("Battery start charging\n");
-        }
-        if (axp.isChargingDoneIRQ()) {
-            DEBUG_MSG("Battery fully charged\n");
-        }
-        if (axp.isVbusRemoveIRQ()) {
-            DEBUG_MSG("USB unplugged\n");
-        }
-        if (axp.isVbusPlugInIRQ()) {
-            DEBUG_MSG("USB plugged In\n");
-        }
-        if (axp.isBattPlugInIRQ()) {
-            DEBUG_MSG("Battery inserted\n");
-        }
-        if (axp.isBattRemoveIRQ()) {
-            DEBUG_MSG("Battery removed\n");
-        }
-        if (axp.isPEKShortPressIRQ()) {
-            DEBUG_MSG("PEK short button press\n");
-        }
-
-        readPowerStatus();
-        axp.clearIRQ();
-    }
-
 #endif
 }

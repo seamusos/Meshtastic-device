@@ -1,42 +1,24 @@
-/*
 
-  Main module
-
-  # Modified by Kyle T. Gabriel to fix issue with incorrect GPS data for TTNMapper
-
-  Copyright (C) 2018 by Xose Pérez <xose dot perez at gmail dot com>
-
-  This program is free software: you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 3 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
-
-*/
-
+#include "Air530GPS.h"
 #include "MeshRadio.h"
 #include "MeshService.h"
-#include "NMEAGPS.h"
 #include "NodeDB.h"
 #include "PowerFSM.h"
 #include "UBloxGPS.h"
-#include "concurrency/Periodic.h"
 #include "configuration.h"
 #include "error.h"
 #include "power.h"
 // #include "rom/rtc.h"
 #include "DSRRouter.h"
 // #include "debug.h"
+#include "RTC.h"
 #include "SPILock.h"
+#include "concurrency/OSThread.h"
+#include "concurrency/Periodic.h"
 #include "graphics/Screen.h"
 #include "main.h"
+#include "meshwifi/meshhttp.h"
+#include "meshwifi/meshwifi.h"
 #include "sleep.h"
 #include "target_specific.h"
 #include <OneButton.h>
@@ -54,8 +36,10 @@
 #include "variant.h"
 #endif
 
+using namespace concurrency;
+
 // We always create a screen object, but we only init it if we find the hardware
-graphics::Screen screen(SSD1306_ADDRESS);
+graphics::Screen *screen;
 
 // Global power status
 meshtastic::PowerStatus *powerStatus = new meshtastic::PowerStatus();
@@ -69,8 +53,7 @@ meshtastic::NodeStatus *nodeStatus = new meshtastic::NodeStatus();
 bool ssd1306_found;
 bool axp192_found;
 
-DSRRouter realRouter;
-Router &router = realRouter; // Users of router don't care what sort of subclass implements that API
+Router *router = NULL; // Users of router don't care what sort of subclass implements that API
 
 uint32_t lastTime = 0;
 uint8_t counter = 0;
@@ -123,7 +106,7 @@ const char *getDeviceName()
     return name;
 }
 
-static uint32_t ledBlinker()
+static int32_t ledBlinker()
 {
     static bool ledOn;
     ledOn ^= 1;
@@ -131,26 +114,104 @@ static uint32_t ledBlinker()
     setLed(ledOn);
 
     // have a very sparse duty cycle of LED being on, unless charging, then blink 0.5Hz square wave rate to indicate that
-    return powerStatus->getIsCharging() ? 1000 : (ledOn ? 2 : 1000);
+    return powerStatus->getIsCharging() ? 1000 : (ledOn ? 1 : 1000);
 }
 
-concurrency::Periodic ledPeriodic(ledBlinker);
+/// Wrapper to convert our powerFSM stuff into a 'thread'
+class PowerFSMThread : public OSThread
+{
+  public:
+    // callback returns the period for the next callback invocation (or 0 if we should no longer be called)
+    PowerFSMThread() : OSThread("PowerFSM") {}
 
+  protected:
+    int32_t runOnce()
+    {
+        powerFSM.run_machine();
+
+        /// If we are in power state we force the CPU to wake every 10ms to check for serial characters (we don't yet wake
+        /// cpu for serial rx - FIXME)
+        canSleep = (powerFSM.getState() != &statePOWER);
+
+        return 10;
+    }
+};
+
+/**
+ * Watch a GPIO and if we get an IRQ, wake the main thread.
+ * Use to add wake on button press
+ */
+void wakeOnIrq(int irq, int mode)
+{
+    attachInterrupt(
+        irq,
+        [] {
+            BaseType_t higherWake = 0;
+            mainDelay.interruptFromISR(&higherWake);
+        },
+        FALLING);
+}
+
+class ButtonThread : public OSThread
+{
 // Prepare for button presses
 #ifdef BUTTON_PIN
-OneButton userButton;
+    OneButton userButton;
 #endif
 #ifdef BUTTON_PIN_ALT
-OneButton userButtonAlt;
+    OneButton userButtonAlt;
 #endif
-void userButtonPressed()
-{
-    powerFSM.trigger(EVENT_PRESS);
-}
-void userButtonPressedLong()
-{
-    screen.adjustBrightness();
-}
+
+  public:
+    // callback returns the period for the next callback invocation (or 0 if we should no longer be called)
+    ButtonThread() : OSThread("Button")
+    {
+#ifdef BUTTON_PIN
+        userButton = OneButton(BUTTON_PIN, true, true);
+        userButton.attachClick(userButtonPressed);
+        userButton.attachDuringLongPress(userButtonPressedLong);
+        wakeOnIrq(BUTTON_PIN, FALLING);
+#endif
+#ifdef BUTTON_PIN_ALT
+        userButtonAlt = OneButton(BUTTON_PIN_ALT, true, true);
+        userButtonAlt.attachClick(userButtonPressed);
+        userButton.attachDuringLongPress(userButtonPressedLong);
+        wakeOnIrq(BUTTON_PIN_ALT, FALLING);
+#endif
+    }
+
+  protected:
+    /// If the button is pressed we suppress CPU sleep until release
+    int32_t runOnce()
+    {
+        canSleep = true; // Assume we should not keep the board awake
+
+#ifdef BUTTON_PIN
+        userButton.tick();
+        canSleep &= userButton.isIdle();
+#endif
+#ifdef BUTTON_PIN_ALT
+        userButtonAlt.tick();
+        canSleep &= userButton.isIdle();
+#endif
+        // if(!canSleep) DEBUG_MSG("Supressing sleep!\n");
+
+        return 5;
+    }
+
+  private:
+    static void userButtonPressed()
+    {
+        // DEBUG_MSG("press!\n");
+        powerFSM.trigger(EVENT_PRESS);
+    }
+    static void userButtonPressedLong() { screen->adjustBrightness(); }
+};
+
+static Periodic *ledPeriodic;
+static OSThread *powerFSMthread, *buttonThread;
+
+RadioInterface *rIf = NULL;
 
 void setup()
 {
@@ -175,6 +236,12 @@ void setup()
     digitalWrite(RESET_OLED, 1);
 #endif
 
+    OSThread::setup();
+
+    ledPeriodic = new Periodic("Blink", ledBlinker);
+
+    router = new DSRRouter();
+
 #ifdef I2C_SDA
     Wire.begin(I2C_SDA, I2C_SCL);
 #else
@@ -186,22 +253,11 @@ void setup()
 #endif
 
     // Buttons & LED
-#ifdef BUTTON_PIN
-    userButton = OneButton(BUTTON_PIN, true, true);
-    userButton.attachClick(userButtonPressed);
-    userButton.attachDuringLongPress(userButtonPressedLong);
-#endif
-#ifdef BUTTON_PIN_ALT
-    userButtonAlt = OneButton(BUTTON_PIN_ALT, true, true);
-    userButtonAlt.attachClick(userButtonPressed);
-    userButton.attachDuringLongPress(userButtonPressedLong);
-#endif
+    buttonThread = new ButtonThread();
 #ifdef LED_PIN
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, 1 ^ LED_INVERTED); // turn on for now
 #endif
-
-    ledPeriodic.setup();
 
     // Hello
     DEBUG_MSG("Meshtastic swver=%s, hwver=%s\n", optstr(APP_VERSION), optstr(HW_VERSION));
@@ -214,15 +270,15 @@ void setup()
     esp32Setup();
 #endif
 
-    // Currently only the tbeam has a PMU
-    power = new Power();
-    power->setup();
-    power->setStatusHandler(powerStatus);
-    powerStatus->observe(&power->newStatus);
-
 #ifdef NRF52_SERIES
     nrf52Setup();
 #endif
+
+    // Currently only the tbeam has a PMU
+    power = new Power();
+    power->setStatusHandler(powerStatus);
+    powerStatus->observe(&power->newStatus);
+    power->setup(); // Must be after status handler is installed, so that handler gets notified of the initial configuration
 
     // Init our SPI controller (must be before screen and lora)
     initSPI();
@@ -235,14 +291,15 @@ void setup()
 #endif
 
     // Initialize the screen first so we can show the logo while we start up everything else.
-#ifdef ST7735_CS
-    screen.setup();
+    screen = new graphics::Screen(SSD1306_ADDRESS);
+#if defined(ST7735_CS) || defined(HAS_EINK)
+    screen->setup();
 #else
     if (ssd1306_found)
-        screen.setup();
+        screen->setup();
 #endif
 
-    screen.print("Started...\n");
+    screen->print("Started...\n");
 
     readFromRTC(); // read the main CPU RTC at first (in case we can't get GPS time)
 
@@ -260,10 +317,14 @@ void setup()
         if (GPS::_serial_gps) {
             // Some boards might have only the TX line from the GPS connected, in that case, we can't configure it at all.  Just
             // assume NMEA at 9600 baud.
+            // dumb NMEA access only work for serial GPSes)
             DEBUG_MSG("Hoping that NMEA might work\n");
 
-            // dumb NMEA access only work for serial GPSes)
+#ifdef HAS_AIR530_GPS
+            gps = new Air530GPS();
+#else
             gps = new NMEAGPS();
+#endif
             gps->setup();
         }
     }
@@ -295,8 +356,7 @@ void setup()
     digitalWrite(SX1262_ANT_SW, 1);
 #endif
 
-    // MUST BE AFTER service.init, so we have our radio config settings (from nodedb init)
-    RadioInterface *rIf = NULL;
+    // radio init MUST BE AFTER service.init, so we have our radio config settings (from nodedb init)
 
 #if defined(RF95_IRQ)
     if (!rIf) {
@@ -331,13 +391,17 @@ void setup()
     }
 #endif
 
+    // Initialize Wifi
+    initWifi();
+
     if (!rIf)
         recordCriticalError(ErrNoRadio);
     else
-        router.addInterface(rIf);
+        router->addInterface(rIf);
 
     // This must be _after_ service.init because we need our preferences loaded from flash to have proper timeout values
     PowerFSM_setup(); // we will transition to ON in a couple of seconds, FIXME, only do this for cold boots, not waking from SDS
+    powerFSMthread = new PowerFSMThread();
 
     // setBluetoothEnable(false); we now don't start bluetooth until we enter the proper state
     setCPUFast(false); // 80MHz is fine for our slow peripherals
@@ -361,21 +425,12 @@ uint32_t axpDebugRead()
   return 30 * 1000;
 }
 
-concurrency::Periodic axpDebugOutput(axpDebugRead);
+Periodic axpDebugOutput(axpDebugRead);
 axpDebugOutput.setup();
 #endif
 
 void loop()
 {
-    uint32_t msecstosleep = 1000 * 30; // How long can we sleep before we again need to service the main loop?
-
-    if (gps)
-        gps->loop(); // FIXME, remove from main, instead block on read
-    router.loop();
-    powerFSM.run_machine();
-    service.loop();
-
-    concurrency::periodicScheduler.loop();
     // axpDebugOutput.loop();
 
     /************* Sensor Testing **************/
@@ -397,23 +452,9 @@ void loop()
 #ifndef NO_ESP32
     esp32Loop();
 #endif
-#ifdef TBEAM_V10
-    power->loop();
-#endif
 
-#ifdef BUTTON_PIN
-    userButton.tick();
-#endif
-#ifdef BUTTON_PIN_ALT
-    userButtonAlt.tick();
-#endif
-
-    // Show boot screen for first 3 seconds, then switch to normal operation.
-    static bool showingBootScreen = true;
-    if (showingBootScreen && (millis() > 3000)) {
-        screen.stopBootScreen();
-        showingBootScreen = false;
-    }
+    // For debugging
+    // if (rIf) ((RadioLibInterface *)rIf)->isActivelyReceiving();
 
 #ifdef DEBUG_STACK
     static uint32_t lastPrint = 0;
@@ -423,16 +464,18 @@ void loop()
     }
 #endif
 
-    // Update the screen last, after we've figured out what to show.
-    screen.debug_info()->setChannelNameStatus(getChannelName());
+    // TODO: This should go into a thread handled by FreeRTOS.
+    handleWebResponse();
 
-    // No GPS lock yet, let the OS put the main CPU in low power mode for 100ms (or until another interrupt comes in)
-    // i.e. don't just keep spinning in loop as fast as we can.
-    // DEBUG_MSG("msecs %d\n", msecstosleep);
+    service.loop();
 
-    // FIXME - until button press handling is done by interrupt (see polling above) we can't sleep very long at all or buttons
-    // feel slow
-    msecstosleep = 10;
+    long delayMsec = mainController.runOrDelay();
 
-    delay(msecstosleep);
+    /* if (mainController.nextThread && delayMsec)
+        DEBUG_MSG("Next %s in %ld\n", mainController.nextThread->ThreadName.c_str(),
+                  mainController.nextThread->tillRun(millis())); */
+
+    // We want to sleep as long as possible here - because it saves power
+    mainDelay.delay(delayMsec);
+    // if (didWake) DEBUG_MSG("wake!\n");
 }

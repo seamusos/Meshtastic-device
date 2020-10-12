@@ -31,6 +31,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "graphics/images.h"
 #include "main.h"
 #include "mesh-pb-constants.h"
+#include "meshwifi/meshwifi.h"
 #include "target_specific.h"
 #include "utils.h"
 
@@ -237,6 +238,22 @@ static void drawGPS(OLEDDisplay *display, int16_t x, int16_t y, const GPSStatus 
         // Draw the number of satellites
         sprintf(satsString, "%d", gps->getNumSatellites());
         display->drawString(x + 34, y - 2, satsString);
+    }
+}
+
+static void drawGPSAltitude(OLEDDisplay *display, int16_t x, int16_t y, const GPSStatus *gps)
+{
+    String displayLine = "";
+    if (!gps->getIsConnected()) {
+        // displayLine = "No GPS Module";
+        // display->drawString(x + (SCREEN_WIDTH - (display->getStringWidth(displayLine))) / 2, y, displayLine);
+    } else if (!gps->getHasLock()) {
+        // displayLine = "No GPS Lock";
+        // display->drawString(x + (SCREEN_WIDTH - (display->getStringWidth(displayLine))) / 2, y, displayLine);
+    } else {
+
+        displayLine = "Altitude: " + String(gps->getAltitude()) + "m";
+        display->drawString(x + (SCREEN_WIDTH - (display->getStringWidth(displayLine))) / 2, y, displayLine);
     }
 }
 
@@ -544,7 +561,9 @@ void _screen_header()
 }
 #endif
 
-Screen::Screen(uint8_t address, int sda, int scl) : cmdQueue(32), dispdev(address, sda, scl), ui(&dispdev) {}
+Screen::Screen(uint8_t address, int sda, int scl) : OSThread("Screen"), cmdQueue(32), dispdev(address, sda, scl), ui(&dispdev) {
+    cmdQueue.setReader(this);
+}
 
 void Screen::handleSetOn(bool on)
 {
@@ -556,9 +575,12 @@ void Screen::handleSetOn(bool on)
             DEBUG_MSG("Turning on screen\n");
             dispdev.displayOn();
             dispdev.displayOn();
+            enabled = true;
+            setInterval(0); // Draw ASAP
         } else {
             DEBUG_MSG("Turning off screen\n");
             dispdev.displayOff();
+            enabled = false;
         }
         screenOn = on;
     }
@@ -566,8 +588,6 @@ void Screen::handleSetOn(bool on)
 
 void Screen::setup()
 {
-    concurrency::PeriodicTask::setup();
-
     // We don't set useDisplay until setup() is called, because some boards have a declaration of this object but the device
     // is never found when probing i2c and therefore we don't call setup and never want to do (invalid) accesses to this device.
     useDisplay = true;
@@ -625,13 +645,23 @@ void Screen::setup()
     nodeStatusObserver.observe(&nodeStatus->onNewStatus);
 }
 
-void Screen::doTask()
+int32_t Screen::runOnce()
 {
     // If we don't have a screen, don't ever spend any CPU for us.
     if (!useDisplay) {
-        setPeriod(0);
-        return;
+        enabled = false;
+        return RUN_SAME;
     }
+
+    // Show boot screen for first 3 seconds, then switch to normal operation.
+    static bool showingBootScreen = true;
+    if (showingBootScreen && (millis() > 3000)) {
+        stopBootScreen();
+        showingBootScreen = false;
+    }
+
+    // Update the screen last, after we've figured out what to show.
+    debug_info()->setChannelNameStatus(getChannelName());
 
     // Process incoming commands.
     for (;;) {
@@ -667,8 +697,8 @@ void Screen::doTask()
 
     if (!screenOn) { // If we didn't just wake and the screen is still off, then
                      // stop updating until it is on again
-        setPeriod(0);
-        return;
+        enabled = false;
+        return 0;
     }
 
     // Switch to a low framerate (to save CPU) when we are not in transition
@@ -694,7 +724,7 @@ void Screen::doTask()
     // soon, otherwise just 1 fps (to save CPU) We also ask to be called twice
     // as fast as we really need so that any rounding errors still result with
     // the correct framerate
-    setPeriod(1000 / targetFramerate);
+    return (1000 / targetFramerate);
 }
 
 void Screen::drawDebugInfoTrampoline(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y)
@@ -709,6 +739,11 @@ void Screen::drawDebugInfoSettingsTrampoline(OLEDDisplay *display, OLEDDisplayUi
     screen->debugInfo.drawFrameSettings(display, state, x, y);
 }
 
+void Screen::drawDebugInfoWiFiTrampoline(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y)
+{
+    Screen *screen = reinterpret_cast<Screen *>(state->userData);
+    screen->debugInfo.drawFrameWiFi(display, state, x, y);
+}
 
 // restore our regular frame list
 void Screen::setFrames()
@@ -739,6 +774,11 @@ void Screen::setFrames()
 
     // call a method on debugInfoScreen object (for more details)
     normalFrames[numframes++] = &Screen::drawDebugInfoSettingsTrampoline;
+
+    if (isWifiAvailable()) {
+        // call a method on debugInfoScreen object (for more details)
+        normalFrames[numframes++] = &Screen::drawDebugInfoWiFiTrampoline;
+    }
 
     ui.setFrames(normalFrames, numframes);
     ui.enableAllIndicators();
@@ -774,7 +814,7 @@ void Screen::handleOnPress()
     // If screen was off, just wake it, otherwise advance to next frame
     // If we are in a transition, the press must have bounced, drop it.
     if (ui.getUiState()->frameState == FIXED) {
-        setPeriod(1); // redraw ASAP
+        setInterval(0); // redraw ASAP
         ui.nextFrame();
 
         DEBUG_MSG("Setting fast framerate\n");
@@ -798,17 +838,17 @@ void DebugInfo::drawFrame(OLEDDisplay *display, OLEDDisplayUiState *state, int16
     {
         concurrency::LockGuard guard(&lock);
         snprintf(channelStr, sizeof(channelStr), "%s", channelName.c_str());
-
-        // Display power status
-        if (powerStatus->getHasBattery())
-            drawBattery(display, x, y + 2, imgBattery, powerStatus);
-        else if (powerStatus->knowsUSB())
-            display->drawFastImage(x, y + 2, 16, 8, powerStatus->getHasUSB() ? imgUSB : imgPower);
-        // Display nodes status
-        drawNodes(display, x + (SCREEN_WIDTH * 0.25), y + 2, nodeStatus);
-        // Display GPS status
-        drawGPS(display, x + (SCREEN_WIDTH * 0.63), y + 2, gpsStatus);
     }
+
+    // Display power status
+    if (powerStatus->getHasBattery())
+        drawBattery(display, x, y + 2, imgBattery, powerStatus);
+    else if (powerStatus->knowsUSB())
+        display->drawFastImage(x, y + 2, 16, 8, powerStatus->getHasUSB() ? imgUSB : imgPower);
+    // Display nodes status
+    drawNodes(display, x + (SCREEN_WIDTH * 0.25), y + 2, nodeStatus);
+    // Display GPS status
+    drawGPS(display, x + (SCREEN_WIDTH * 0.63), y + 2, gpsStatus);
 
     // Draw the channel name
     display->drawString(x, y + FONT_HEIGHT, channelStr);
@@ -828,6 +868,135 @@ void DebugInfo::drawFrame(OLEDDisplay *display, OLEDDisplayUiState *state, int16
 }
 
 // Jm
+void DebugInfo::drawFrameWiFi(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y)
+{
+#ifdef HAS_WIFI
+    const char *wifiName = radioConfig.preferences.wifi_ssid;
+    const char *wifiPsw = radioConfig.preferences.wifi_password;
+
+    displayedNodeNum = 0; // Not currently showing a node pane
+
+    display->setFont(ArialMT_Plain_10);
+
+    // The coordinates define the left starting point of the text
+    display->setTextAlignment(TEXT_ALIGN_LEFT);
+
+    if (radioConfig.preferences.wifi_ap_mode) {
+        display->drawString(x, y, String("WiFi: Software AP"));
+    } else if (WiFi.status() != WL_CONNECTED) {
+        display->drawString(x, y, String("WiFi: Not Connected"));
+    } else {
+        display->drawString(x, y, String("WiFi: Connected"));
+
+        display->drawString(x + SCREEN_WIDTH - display->getStringWidth("RSSI " + String(WiFi.RSSI())), y,
+                            "RSSI " + String(WiFi.RSSI()));
+    }
+
+    /*
+    - WL_CONNECTED: assigned when connected to a WiFi network;
+    - WL_NO_SSID_AVAIL: assigned when no SSID are available;
+    - WL_CONNECT_FAILED: assigned when the connection fails for all the attempts;
+    - WL_CONNECTION_LOST: assigned when the connection is lost;
+    - WL_DISCONNECTED: assigned when disconnected from a network;
+    - WL_IDLE_STATUS: it is a temporary status assigned when WiFi.begin() is called and remains active until the number of
+    attempts expires (resulting in WL_CONNECT_FAILED) or a connection is established (resulting in WL_CONNECTED);
+    - WL_SCAN_COMPLETED: assigned when the scan networks is completed;
+    - WL_NO_SHIELD: assigned when no WiFi shield is present;
+
+    */
+
+    if (WiFi.status() == WL_CONNECTED) {
+        if (radioConfig.preferences.wifi_ap_mode) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "IP: " + String(WiFi.softAPIP().toString().c_str()));
+        } else {
+            display->drawString(x, y + FONT_HEIGHT * 1, "IP: " + String(WiFi.localIP().toString().c_str()));
+        }
+    } else if (WiFi.status() == WL_NO_SSID_AVAIL) {
+        display->drawString(x, y + FONT_HEIGHT * 1, "SSID Not Found");
+    } else if (WiFi.status() == WL_CONNECTION_LOST) {
+        display->drawString(x, y + FONT_HEIGHT * 1, "Connection Lost");
+    } else if (WiFi.status() == WL_CONNECT_FAILED) {
+        display->drawString(x, y + FONT_HEIGHT * 1, "Connection Failed");
+        //} else if (WiFi.status() == WL_DISCONNECTED) {
+        //    display->drawString(x, y + FONT_HEIGHT * 1, "Disconnected");
+    } else if (WiFi.status() == WL_IDLE_STATUS) {
+        display->drawString(x, y + FONT_HEIGHT * 1, "Idle ... Reconnecting");
+    } else {
+        // Codes:
+        // https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/wifi.html#wi-fi-reason-code
+        if (getWifiDisconnectReason() == 2) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "Authentication Invalid");
+        } else if (getWifiDisconnectReason() == 3) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "De-authenticated");
+        } else if (getWifiDisconnectReason() == 4) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "Disassociated Expired");
+        } else if (getWifiDisconnectReason() == 5) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "AP - Too Many Clients");
+        } else if (getWifiDisconnectReason() == 6) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "NOT_AUTHED");
+        } else if (getWifiDisconnectReason() == 7) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "NOT_ASSOCED");
+        } else if (getWifiDisconnectReason() == 8) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "Disassociated");
+        } else if (getWifiDisconnectReason() == 9) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "ASSOC_NOT_AUTHED");
+        } else if (getWifiDisconnectReason() == 10) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "DISASSOC_PWRCAP_BAD");
+        } else if (getWifiDisconnectReason() == 11) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "DISASSOC_SUPCHAN_BAD");
+        } else if (getWifiDisconnectReason() == 13) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "IE_INVALID");
+        } else if (getWifiDisconnectReason() == 14) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "MIC_FAILURE");
+        } else if (getWifiDisconnectReason() == 15) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "AP Handshake Timeout");
+        } else if (getWifiDisconnectReason() == 16) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "GROUP_KEY_UPDATE_TIMEOUT");
+        } else if (getWifiDisconnectReason() == 17) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "IE_IN_4WAY_DIFFERS");
+        } else if (getWifiDisconnectReason() == 18) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "Invalid Group Cipher");
+        } else if (getWifiDisconnectReason() == 19) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "Invalid Pairwise Cipher");
+        } else if (getWifiDisconnectReason() == 20) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "AKMP_INVALID");
+        } else if (getWifiDisconnectReason() == 21) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "UNSUPP_RSN_IE_VERSION");
+        } else if (getWifiDisconnectReason() == 22) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "INVALID_RSN_IE_CAP");
+        } else if (getWifiDisconnectReason() == 23) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "802_1X_AUTH_FAILED");
+        } else if (getWifiDisconnectReason() == 24) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "CIPHER_SUITE_REJECTED");
+        } else if (getWifiDisconnectReason() == 200) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "BEACON_TIMEOUT");
+        } else if (getWifiDisconnectReason() == 201) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "AP Not Found");
+        } else if (getWifiDisconnectReason() == 202) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "AUTH_FAIL");
+        } else if (getWifiDisconnectReason() == 203) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "ASSOC_FAIL");
+        } else if (getWifiDisconnectReason() == 204) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "HANDSHAKE_TIMEOUT");
+        } else if (getWifiDisconnectReason() == 205) {
+            display->drawString(x, y + FONT_HEIGHT * 1, "Connection Failed");
+        } else {
+            display->drawString(x, y + FONT_HEIGHT * 1, "Unknown Status");
+        }
+    }
+
+    display->drawString(x, y + FONT_HEIGHT * 2, "SSID: " + String(wifiName));
+    display->drawString(x, y + FONT_HEIGHT * 3, "PWD: " + String(wifiPsw));
+
+    /* Display a heartbeat pixel that blinks every time the frame is redrawn */
+#ifdef SHOW_REDRAWS
+    if (heartbeat)
+        display->setPixel(0, 0);
+    heartbeat = !heartbeat;
+#endif
+#endif
+}
+
 void DebugInfo::drawFrameSettings(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y)
 {
     displayedNodeNum = 0; // Not currently showing a node pane
@@ -838,30 +1007,22 @@ void DebugInfo::drawFrameSettings(OLEDDisplay *display, OLEDDisplayUiState *stat
     display->setTextAlignment(TEXT_ALIGN_LEFT);
 
     char batStr[20];
-    if (powerStatus->getHasBattery()) 
-    {
+    if (powerStatus->getHasBattery()) {
         int batV = powerStatus->getBatteryVoltageMv() / 1000;
         int batCv = (powerStatus->getBatteryVoltageMv() % 1000) / 10;
 
-        snprintf(batStr, sizeof(batStr), "B %01d.%02dV %3d%% %c%c",
-            batV,
-            batCv,
-            powerStatus->getBatteryChargePercent(),
-            powerStatus->getIsCharging() ? '+' : ' ',
-            powerStatus->getHasUSB() ? 'U' : ' ');
+        snprintf(batStr, sizeof(batStr), "B %01d.%02dV %3d%% %c%c", batV, batCv, powerStatus->getBatteryChargePercent(),
+                 powerStatus->getIsCharging() ? '+' : ' ', powerStatus->getHasUSB() ? 'U' : ' ');
 
         // Line 1
         display->drawString(x, y, batStr);
-    } 
-    else 
-    {
+    } else {
         // Line 1
         display->drawString(x, y, String("USB"));
-    } 
+    }
 
-
-    //TODO: Display status of the BT radio
-    // display->drawString(x + SCREEN_WIDTH - display->getStringWidth("BT On"), y, "BT On");
+    display->drawString(x + SCREEN_WIDTH - display->getStringWidth("Mode " + String(channelSettings.modem_config)), y,
+                        "Mode " + String(channelSettings.modem_config));
 
     // Line 2
     uint32_t currentMillis = millis();
@@ -874,19 +1035,15 @@ void DebugInfo::drawFrameSettings(OLEDDisplay *display, OLEDDisplayUiState *stat
     minutes %= 60;
     hours %= 24;
 
-    display->drawString(x, y + FONT_HEIGHT * 1, String(days) + "d " 
-        + (hours < 10 ? "0" : "") + String(hours) + ":" 
-        + (minutes < 10 ? "0" : "") + String(minutes) + ":" 
-        + (seconds < 10 ? "0" : "") + String(seconds));
-    display->drawString(x + SCREEN_WIDTH - display->getStringWidth("Mode " + String(channelSettings.modem_config)), y + FONT_HEIGHT * 1, "Mode " + String(channelSettings.modem_config));
+    display->drawString(x, y + FONT_HEIGHT * 1,
+                        String(days) + "d " + (hours < 10 ? "0" : "") + String(hours) + ":" + (minutes < 10 ? "0" : "") +
+                            String(minutes) + ":" + (seconds < 10 ? "0" : "") + String(seconds));
 
     // Line 3
-    // TODO: Use this line for WiFi information.
-    // display->drawString(x + (SCREEN_WIDTH - (display->getStringWidth("WiFi: 192.168.0.100"))) / 2, y + FONT_HEIGHT * 2, "WiFi: 192.168.0.100");
+    drawGPSAltitude(display, x, y + FONT_HEIGHT * 2, gpsStatus);
 
     // Line 4
     drawGPScoordinates(display, x, y + FONT_HEIGHT * 3, gpsStatus);
-
 
     /* Display a heartbeat pixel that blinks every time the frame is redrawn */
 #ifdef SHOW_REDRAWS
@@ -918,7 +1075,7 @@ int Screen::handleStatusUpdate(const meshtastic::Status *arg)
         if (nodeDB.updateTextMessage || nodeStatus->getLastNumTotal() != nodeStatus->getNumTotal()) {
             setFrames();    // Regen the list of screens
             prevFrame = -1; // Force a GUI update
-            setPeriod(1);   // Update the screen right away
+            setInterval(0); // Update the screen right away
         }
         nodeDB.updateGUI = false;
         nodeDB.updateTextMessage = false;
