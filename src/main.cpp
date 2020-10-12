@@ -379,10 +379,10 @@ void loop()
     // axpDebugOutput.loop();
 
     /************* Sensor Testing **************/
-    if((millis() - lastTime) >= 1000)
+    if((millis() - lastTime) >= 10000)
     {
         counter++;
-        uint8_t dataString[] = "Hello There";
+        uint8_t dataString[] = "Water yo plant";
         // sprintf(dataString, "Counter = %c", counter);
         service.sendTextMessage(dataString, sizeof(dataString));
         lastTime = millis();
