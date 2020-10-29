@@ -36,6 +36,10 @@
 #include "variant.h"
 #endif
 
+#include <Adafruit_Sensor.h>
+#include "Adafruit_BME680.h"
+#include "Adafruit_LC709203F.h"
+
 using namespace concurrency;
 
 // We always create a screen object, but we only init it if we find the hardware
@@ -212,6 +216,13 @@ static Periodic *ledPeriodic;
 static OSThread *powerFSMthread, *buttonThread;
 
 RadioInterface *rIf = NULL;
+
+volatile int buttonflag = 0;
+
+void testInterrupt();
+Adafruit_BME680 bme; // I2C
+Adafruit_LC709203F lc;
+
 
 void setup()
 {
@@ -405,6 +416,28 @@ void setup()
 
     // setBluetoothEnable(false); we now don't start bluetooth until we enter the proper state
     setCPUFast(false); // 80MHz is fine for our slow peripherals
+
+
+    /************* Sensor Testing *****************/
+    // pinMode(PIN_BUTTON4, INPUT_PULLUP);
+    // attachInterrupt(digitalPinToInterrupt(PIN_BUTTON4), testInterrupt, RISING);
+    
+    if (!bme.begin()) {
+        DEBUG_PORT.println("Could not find a valid BME680 sensor, check wiring!");
+    while (1);
+    }
+
+
+
+    if (!lc.begin()) {
+        DEBUG_PORT.println(F("Couldnt find Adafruit LC709203F?\nMake sure a battery is plugged in!"));
+        while (1) delay(10);
+    }
+    DEBUG_PORT.println("lc Started");
+
+    lc.setPackSize(LC709203F_APA_2000MAH);
+
+
     
 }
 
@@ -436,12 +469,54 @@ void loop()
     /************* Sensor Testing **************/
     if((millis() - lastTime) >= 10000)
     {
-        counter++;
-        uint8_t dataString[] = "Water yo plant";
+        union sensorUnion
+        {
+            char dataString[50] = "";
+            uint8_t sendString[50];
+        };
+        sensorUnion data;
+        
+        if (! bme.performReading()) {
+            Serial.println("Failed to perform reading :(");
+            return;
+        }
+        // counter++;
+        // data.dataString[0] = "";
+
+
+        strcat(data.dataString, "Temp:");
+        String test = String(bme.temperature);
+        strcat(data.dataString, test.c_str());
+
+        strcat(data.dataString, ", humi: ");
+        test = String(bme.humidity);
+        strcat(data.dataString, test.c_str());
+
+        strcat(data.dataString, ", pres: ");
+        test = String(bme.pressure / 100.00);
+        strcat(data.dataString, test.c_str());
+
+        
+        float cellVoltage = lc.cellVoltage();
+        float batPercentage = lc.cellPercent();
+
+        strcat(data.dataString, ", bat: ");
+        test = String(batPercentage);
+        strcat(data.dataString, test.c_str());
+
         // sprintf(dataString, "Counter = %c", counter);
-        service.sendTextMessage(dataString, sizeof(dataString));
+        service.sendTextMessage(data.sendString, sizeof(data.dataString));
         lastTime = millis();
     }
+
+    // if(buttonflag > 0)
+    // {
+    //     counter++;
+    //     uint8_t dataString[] = "Button Press";
+    //     // sprintf(dataString, "Counter = %c", counter);
+    //     service.sendTextMessage(dataString, sizeof(dataString));
+    //     buttonflag--;
+    // }
 
 #ifdef DEBUG_PORT
     DEBUG_PORT.loop(); // Send/receive protobufs over the serial port
@@ -478,4 +553,10 @@ void loop()
     // We want to sleep as long as possible here - because it saves power
     mainDelay.delay(delayMsec);
     // if (didWake) DEBUG_MSG("wake!\n");
+}
+
+
+void testInterrupt()
+{
+    buttonflag++;
 }

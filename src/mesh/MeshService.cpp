@@ -338,7 +338,7 @@ void MeshService::sendTextMessage(uint8_t *array, size_t size)
     // uint8_t data[] = "AB";
     
     //Allocate Mesh packet
-    MeshPacket *p = router.allocForSending();
+    MeshPacket *p = router->allocForSending();
     p->decoded.which_payload = SubPacket_data_tag;
 
     p->decoded.data.typ = Data_Type_CLEAR_TEXT; //Modify for different types of data
