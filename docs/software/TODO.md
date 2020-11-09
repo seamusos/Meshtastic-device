@@ -2,6 +2,12 @@
 
 You probably don't care about this section - skip to the next one.
 
+For high speed/lots of devices/short range tasks:
+
+- When guessing numhops for sending: if I've heard from many local (0 hop neighbors) decrease hopcount by 2 rather than 1. 
+This should nicely help 'router' nodes do the right thing when long range, or if there are many local nodes for short range.
+- fix timeouts/delays to be based on packet length at current radio settings
+
 Nimble tasks:
 
 - readerror.txt stress test bug

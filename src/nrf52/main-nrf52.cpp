@@ -1,6 +1,6 @@
 #include "NRF52Bluetooth.h"
 #include "configuration.h"
-#include "graphics/TFT.h"
+#include "graphics/TFTDisplay.h"
 #include <assert.h>
 #include <ble_gap.h>
 #include <memory.h>
@@ -49,17 +49,23 @@ void getMacAddr(uint8_t *dmac)
 NRF52Bluetooth *nrf52Bluetooth;
 
 static bool bleOn = false;
+static const bool enableBle = false; // Set to false for easier debugging
+
 void setBluetoothEnable(bool on)
 {
     if (on != bleOn) {
         if (on) {
             if (!nrf52Bluetooth) {
-                // DEBUG_MSG("DISABLING NRF52 BLUETOOTH WHILE DEBUGGING\n");
-                nrf52Bluetooth = new NRF52Bluetooth();
-                nrf52Bluetooth->setup();
+                if (!enableBle)
+                    DEBUG_MSG("DISABLING NRF52 BLUETOOTH WHILE DEBUGGING\n");
+                else {
+                    nrf52Bluetooth = new NRF52Bluetooth();
+                    nrf52Bluetooth->setup();
+                }
             }
         } else {
-            DEBUG_MSG("FIXME: implement BLE disable\n");
+            if(nrf52Bluetooth)
+                nrf52Bluetooth->shutdown();
         }
         bleOn = on;
     }
@@ -77,6 +83,8 @@ int printf(const char *fmt, ...)
     return res;
 }
 
+#include "BQ25713.h"
+
 void nrf52Setup()
 {
 
@@ -88,8 +96,11 @@ void nrf52Setup()
     // This is the recommended setting for Monitor Mode Debugging
     NVIC_SetPriority(DebugMonitor_IRQn, 6UL);
 
-    // Not yet on board
-    // pmu.init();
+#ifdef BQ25703A_ADDR
+    auto *bq = new BQ25713();
+    if(!bq->setup())
+        DEBUG_MSG("ERROR! Charge controller init failed\n");
+#endif
 
     // Init random seed
     // FIXME - use this to get random numbers
@@ -99,4 +110,22 @@ void nrf52Setup()
     // randomSeed(r);
     DEBUG_MSG("FIXME, call randomSeed\n");
     // ::printf("TESTING PRINTF\n");
+}
+
+void cpuDeepSleep(uint64_t msecToWake)
+{
+  DEBUG_MSG("FIXME: implement NRF52 deep sleep enter actions\n");
+  // FIXME, configure RTC to wake us
+  // FIXME, power down SPI, I2C, RAMs
+
+  // FIXME, use system off mode with ram retention for key state?
+  // FIXME, use non-init RAM per https://devzone.nordicsemi.com/f/nordic-q-a/48919/ram-retention-settings-with-softdevice-enabled
+
+  while(1) {
+    delay(5000);
+    DEBUG_MSG(".");
+  }
+
+  // FIXME, after wake power up SPI, I2C, RAMs, reinit LORA
+  DEBUG_MSG("FIXME: implement NRF52 deep sleep wake actions\n");
 }

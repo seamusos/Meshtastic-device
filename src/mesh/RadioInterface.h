@@ -36,7 +36,7 @@ typedef struct {
  *
  * This defines the SOLE API for talking to radios (because soon we will have alternate radio implementations)
  */
-class RadioInterface : protected concurrency::NotifiedWorkerThread
+class RadioInterface 
 {
     friend class MeshRadio; // for debugging we let that class touch pool
     PointerQueue<MeshPacket> *rxDest = NULL;
@@ -48,7 +48,7 @@ class RadioInterface : protected concurrency::NotifiedWorkerThread
         CallbackObserver<RadioInterface, void *>(this, &RadioInterface::preflightSleepCb);
 
     CallbackObserver<RadioInterface, void *> notifyDeepSleepObserver =
-        CallbackObserver<RadioInterface, void *>(this, &RadioInterface::notifyDeepSleepDb);
+        CallbackObserver<RadioInterface, void *>(this, &RadioInterface::notifyDeepSleepCb);
 
   protected:
     MeshPacket *sendingPacket = NULL; // The packet we are currently sending
@@ -71,6 +71,8 @@ class RadioInterface : protected concurrency::NotifiedWorkerThread
      * rxDest is where we will send any rx packets, it becomes receivers responsibility to return packet to the pool
      */
     RadioInterface();
+
+    virtual ~RadioInterface() {}
 
     /**
      * Set where to deliver received packets.  This method should only be used by the Router class
@@ -117,8 +119,6 @@ class RadioInterface : protected concurrency::NotifiedWorkerThread
      */
     size_t beginSending(MeshPacket *p);
 
-    virtual void loop() {} // Idle processing
-
     /**
      * Some regulatory regions limit xmit power.
      * This function should be called by subclasses after setting their desired power.  It might lower it
@@ -136,11 +136,7 @@ class RadioInterface : protected concurrency::NotifiedWorkerThread
     /// Return 0 if sleep is okay
     int preflightSleepCb(void *unused = NULL) { return canSleep() ? 0 : 1; }
 
-    int notifyDeepSleepDb(void *unused = NULL)
-    {
-        sleep();
-        return 0;
-    }
+    int notifyDeepSleepCb(void *unused = NULL);
 
     int reloadConfig(void *unused)
     {
