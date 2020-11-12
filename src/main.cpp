@@ -39,6 +39,7 @@
 #include <Adafruit_Sensor.h>
 #include "Adafruit_BME680.h"
 #include "Adafruit_LC709203F.h"
+#include <CayenneLPP.h>
 
 using namespace concurrency;
 
@@ -469,43 +470,69 @@ void loop()
     /************* Sensor Testing **************/
     if((millis() - lastTime) >= 10000)
     {
-        union sensorUnion
-        {
-            char dataString[50] = "";
-            uint8_t sendString[50];
-        };
-        sensorUnion data;
+          DynamicJsonDocument jsonBuffer(1024);
+        CayenneLPP lpp(200);
+
+          JsonObject root = jsonBuffer.to<JsonObject>();
+
+
+
+
+        // union sensorUnion
+        // {
+        //     char dataString[50] = "";
+        //     uint8_t sendString[50];
+        // };
+        // sensorUnion data;
         
         if (! bme.performReading()) {
-            Serial.println("Failed to perform reading :(");
+            DEBUG_PORT.println("Failed to perform reading :(");
             return;
         }
-        // counter++;
-        // data.dataString[0] = "";
 
-
-        strcat(data.dataString, "Temp:");
-        String test = String(bme.temperature);
-        strcat(data.dataString, test.c_str());
-
-        strcat(data.dataString, ", humi: ");
-        test = String(bme.humidity);
-        strcat(data.dataString, test.c_str());
-
-        strcat(data.dataString, ", pres: ");
-        test = String(bme.pressure / 100.00);
-        strcat(data.dataString, test.c_str());
-
-        
         float cellVoltage = lc.cellVoltage();
         float batPercentage = lc.cellPercent();
 
-        strcat(data.dataString, ", bat: ");
-        test = String(batPercentage);
-        strcat(data.dataString, test.c_str());
+        lpp.reset();
+        lpp.addTemperature(1, bme.temperature);
+        lpp.addRelativeHumidity(2, bme.humidity);
+        lpp.addBarometricPressure(3, bme.pressure/100.00);
+
+        lpp.addPercentage(4, batPercentage);
+
+        // DEBUG_PORT.print("Binary Enocded Packet = ");
+        // DEBUG_PORT.write(lpp.getBuffer(), lpp.getSize());
+
+        lpp.decodeTTN(lpp.getBuffer(), lpp.getSize(), root);
+        serializeJsonPretty(root, DEBUG_PORT);
+        DEBUG_PORT.println();
+
+        service.sendTextMessage(lpp.getBuffer() , lpp.getSize());
+
+
+
+        // strcat(data.dataString, "Temp:");
+        // String test = String(bme.temperature);
+        // strcat(data.dataString, test.c_str());
+
+        // strcat(data.dataString, ", humi: ");
+        // test = String(bme.humidity);
+        // strcat(data.dataString, test.c_str());
+
+        // strcat(data.dataString, ", pres: ");
+        // test = String(bme.pressure / 100.00);
+        // strcat(data.dataString, test.c_str());
+
+        
+
+
+        // strcat(data.dataString, ", bat: ");
+        // test = String(batPercentage);
+        // strcat(data.dataString, test.c_str());
 
         // sprintf(dataString, "Counter = %c", counter);
-        service.sendTextMessage(data.sendString, sizeof(data.dataString));
+
+        // service.sendTextMessage(data.sendString, sizeof(data.dataString));
         lastTime = millis();
     }
 
