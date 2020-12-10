@@ -36,9 +36,9 @@
 #include "variant.h"
 #endif
 
-#include <Adafruit_Sensor.h>
-#include "Adafruit_BME680.h"
-#include "Adafruit_LC709203F.h"
+// #include <Adafruit_Sensor.h>
+// #include "Adafruit_BME680.h"
+// #include "Adafruit_LC709203F.h"
 #include <CayenneLPP.h>
 
 using namespace concurrency;
@@ -221,8 +221,14 @@ RadioInterface *rIf = NULL;
 volatile int buttonflag = 0;
 
 void testInterrupt();
-Adafruit_BME680 bme; // I2C
-Adafruit_LC709203F lc;
+// Adafruit_BME680 bme; // I2C
+// Adafruit_LC709203F lc;
+
+DynamicJsonDocument jsonBuffer(1024);
+CayenneLPP lpp(50);
+
+
+JsonArray root = jsonBuffer.to<JsonArray>();
 
 
 void setup()
@@ -423,20 +429,20 @@ void setup()
     // pinMode(PIN_BUTTON4, INPUT_PULLUP);
     // attachInterrupt(digitalPinToInterrupt(PIN_BUTTON4), testInterrupt, RISING);
     
-    if (!bme.begin()) {
-        DEBUG_PORT.println("Could not find a valid BME680 sensor, check wiring!");
-    while (1);
-    }
+    // if (!bme.begin()) {
+    //     DEBUG_PORT.println("Could not find a valid BME680 sensor, check wiring!");
+    // while (1);
+    // }
 
 
 
-    if (!lc.begin()) {
-        DEBUG_PORT.println(F("Couldnt find Adafruit LC709203F?\nMake sure a battery is plugged in!"));
-        while (1) delay(10);
-    }
-    DEBUG_PORT.println("lc Started");
+    // if (!lc.begin()) {
+    //     DEBUG_PORT.println(F("Couldnt find Adafruit LC709203F?\nMake sure a battery is plugged in!"));
+    //     while (1) delay(10);
+    // }
+    // DEBUG_PORT.println("lc Started");
 
-    lc.setPackSize(LC709203F_APA_2000MAH);
+    // lc.setPackSize(LC709203F_APA_2000MAH);
 
 
     
@@ -470,58 +476,58 @@ void loop()
     /************* Sensor Testing **************/
     if((millis() - lastTime) >= 10000)
     {
-          DynamicJsonDocument jsonBuffer(1024);
-        CayenneLPP lpp(200);
 
-          JsonObject root = jsonBuffer.to<JsonObject>();
+        char string[] = "Hello There";
 
-
+        uint8_t *payload = (uint8_t *)string;
 
 
-        // union sensorUnion
-        // {
-        //     char dataString[50] = "";
-        //     uint8_t sendString[50];
-        // };
-        // sensorUnion data;
+
+
+
+        // service.sendTextMessage(payload ,sizeof(string));
+
         
-        if (! bme.performReading()) {
-            DEBUG_PORT.println("Failed to perform reading :(");
-            return;
-        }
+        // if (! bme.performReading()) {
+        //     DEBUG_PORT.println("Failed to perform reading :(");
+        //     return;
+        // }
 
-        float cellVoltage = lc.cellVoltage();
-        float batPercentage = lc.cellPercent();
+        // float cellVoltage = lc.cellVoltage();
+        // float batPercentage = lc.cellPercent();
+        float temperature = 25.05;
+        float humidity = 60.0;
+        float pressure = 1012.00;
 
         lpp.reset();
-        lpp.addTemperature(1, bme.temperature);
-        lpp.addRelativeHumidity(2, bme.humidity);
-        lpp.addBarometricPressure(3, bme.pressure/100.00);
+        lpp.addTemperature(1, temperature);
+        lpp.addRelativeHumidity(2, humidity);
+        // lpp.addBarometricPressure(3, pressure);
 
-        lpp.addPercentage(4, batPercentage);
+        // lpp.addPercentage(4, batPercentage);
 
-        // DEBUG_PORT.print("Binary Enocded Packet = ");
+        uint8_t buffer[lpp.getSize()];
+
+        lpp.copy(buffer);
+
+        DEBUG_PORT.print("Binary Enocded Packet = ");
+        // for (size_t i = 0; i < sizeof(buffer); i++)
+        // {
+        //     /* code */
+        //     DEBUG_PORT.print(buffer[i]);
+        // }
+
+        Serial2.write(buffer, lpp.getSize());
+        
+
         // DEBUG_PORT.write(lpp.getBuffer(), lpp.getSize());
 
-        lpp.decodeTTN(lpp.getBuffer(), lpp.getSize(), root);
-        serializeJsonPretty(root, DEBUG_PORT);
-        DEBUG_PORT.println();
+        // lpp.decode(lpp.getBuffer(), lpp.getSize(), root);
+        // serializeJsonPretty(root, DEBUG_PORT);
+        // DEBUG_PORT.println();
 
-        service.sendTextMessage(lpp.getBuffer() , lpp.getSize());
+        service.sendTextMessage(lpp.getBuffer() ,lpp.getSize());
 
-
-
-        // strcat(data.dataString, "Temp:");
-        // String test = String(bme.temperature);
-        // strcat(data.dataString, test.c_str());
-
-        // strcat(data.dataString, ", humi: ");
-        // test = String(bme.humidity);
-        // strcat(data.dataString, test.c_str());
-
-        // strcat(data.dataString, ", pres: ");
-        // test = String(bme.pressure / 100.00);
-        // strcat(data.dataString, test.c_str());
 
         
 

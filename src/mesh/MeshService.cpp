@@ -343,10 +343,16 @@ void MeshService::sendTextMessage(uint8_t *array, size_t size)
 
     p->decoded.data.typ = Data_Type_CLEAR_TEXT; //Modify for different types of data
     // p->decoded.data.payload
-    p->decoded.data.payload.size = size - 1;
+    p->decoded.data.payload.size = size;
+
+    DEBUG_PORT.print("\n Size of payload: ");
+    DEBUG_PORT.print(size);
+
+    DEBUG_PORT.print("\n In message: ");
     for (size_t i = 0; i <= size - 1; i++)
     {
         p->decoded.data.payload.bytes[i] = array[i];
+        DEBUG_PORT.print(array[i]);
     }   
 
     sendToMesh(p);

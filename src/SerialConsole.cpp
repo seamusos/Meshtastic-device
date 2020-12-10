@@ -4,7 +4,16 @@
 #include <Arduino.h>
 
 
+
+
+#ifdef ARDUINO_NRF52840_PCA10056
+#define Port Serial2
+
+#else 
 #define Port Serial
+
+#endif
+
 // #ifndef ARDUINO_NRF52840_PCA10056
 // #define Port Serial
 // #else 
