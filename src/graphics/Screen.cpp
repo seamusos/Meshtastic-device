@@ -32,6 +32,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "main.h"
 #include "mesh-pb-constants.h"
 #include "meshwifi/meshwifi.h"
+#include "plugins/TextMessagePlugin.h"
 #include "target_specific.h"
 #include "utils.h"
 
@@ -85,13 +86,16 @@ static uint16_t displayWidth, displayHeight;
 #define SCREEN_TRANSITION_MSECS 300
 #endif
 
-static void drawBootScreen(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y)
+/**
+ * Draw the icon with extra info printed around the corners
+ */
+static void drawIconScreen(const char *upperMsg, OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y)
 {
     // draw an xbm image.
     // Please note that everything that should be transitioned
     // needs to be drawn relative to x and y
 
-    // draw centered left to right and centered above the one line of app text
+    // draw centered icon left to right and centered above the one line of app text
     display->drawXbm(x + (SCREEN_WIDTH - icon_width) / 2, y + (SCREEN_HEIGHT - FONT_HEIGHT_MEDIUM - icon_height) / 2 + 2,
                      icon_width, icon_height, (const uint8_t *)icon_bits);
 
@@ -101,15 +105,31 @@ static void drawBootScreen(OLEDDisplay *display, OLEDDisplayUiState *state, int1
     display->drawString(x + getStringCenteredX(title), y + SCREEN_HEIGHT - FONT_HEIGHT_MEDIUM, title);
     display->setFont(FONT_SMALL);
 
-    const char *region = myRegion ? myRegion->name : NULL;
-    if (region)
-        display->drawString(x + 0, y + 0, region);
+    // Draw region in upper left
+    if (upperMsg)
+        display->drawString(x + 0, y + 0, upperMsg);
 
+    // Draw version in upper right
     char buf[16];
     snprintf(buf, sizeof(buf), "%s",
              xstr(APP_VERSION)); // Note: we don't bother printing region or now, it makes the string too long
     display->drawString(x + SCREEN_WIDTH - display->getStringWidth(buf), y + 0, buf);
     screen->forceDisplay();
+
+    // FIXME - draw serial # somewhere?
+}
+
+static void drawBootScreen(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y)
+{
+    // Draw region in upper left
+    const char *region = myRegion ? myRegion->name : NULL;
+    drawIconScreen(region, display, state, x, y);
+}
+
+/// Used on eink displays while in deep sleep
+static void drawSleepScreen(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y)
+{
+    drawIconScreen("Sleeping...", display, state, x, y);
 }
 
 static void drawFrameBluetooth(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y)
@@ -600,6 +620,21 @@ Screen::Screen(uint8_t address, int sda, int scl) : OSThread("Screen"), cmdQueue
     cmdQueue.setReader(this);
 }
 
+/**
+ * Prepare the display for the unit going to the lowest power mode possible.  Most screens will just
+ * poweroff, but eink screens will show a "I'm sleeping" graphic, possibly with a QR code
+ */
+void Screen::doDeepSleep()
+{
+#ifdef HAS_EINK
+    static FrameCallback sleepFrames[] = {drawSleepScreen};
+    static const int sleepFrameCount = sizeof(sleepFrames) / sizeof(sleepFrames[0]);
+    ui.setFrames(sleepFrames, sleepFrameCount);
+    ui.update();
+#endif
+    setOn(false);
+}
+
 void Screen::handleSetOn(bool on)
 {
     if (!useDisplay)
@@ -636,7 +671,7 @@ void Screen::setup()
     displayWidth = dispdev.width();
     displayHeight = dispdev.height();
 
-    ui.setTimePerTransition(SCREEN_TRANSITION_MSECS);  
+    ui.setTimePerTransition(SCREEN_TRANSITION_MSECS);
 
     ui.setIndicatorPosition(BOTTOM);
     // Defines where the first frame is located in the bar.
@@ -686,6 +721,7 @@ void Screen::setup()
     powerStatusObserver.observe(&powerStatus->onNewStatus);
     gpsStatusObserver.observe(&gpsStatus->onNewStatus);
     nodeStatusObserver.observe(&nodeStatus->onNewStatus);
+    textMessageObserver.observe(&textMessagePlugin);
 }
 
 void Screen::forceDisplay()
@@ -1052,7 +1088,7 @@ void DebugInfo::drawFrameWiFi(OLEDDisplay *display, OLEDDisplayUiState *state, i
         }
     }
 
-    if ((millis() / 1000) % 2) {
+    if ((millis() / 10000) % 2) {
         display->drawString(x, y + FONT_HEIGHT_SMALL * 2, "SSID: " + String(wifiName));
     } else {
         display->drawString(x, y + FONT_HEIGHT_SMALL * 2, "PWD: " + String(wifiPsw));
@@ -1149,14 +1185,24 @@ int Screen::handleStatusUpdate(const meshtastic::Status *arg)
     // DEBUG_MSG("Screen got status update %d\n", arg->getStatusType());
     switch (arg->getStatusType()) {
     case STATUS_TYPE_NODE:
-        if (showingNormalScreen && (nodeDB.updateTextMessage || nodeStatus->getLastNumTotal() != nodeStatus->getNumTotal())) {
+        if (showingNormalScreen &&
+            nodeStatus->getLastNumTotal() != nodeStatus->getNumTotal()) {
             setFrames(); // Regen the list of screens
         }
         nodeDB.updateGUI = false;
-        nodeDB.updateTextMessage = false;
         break;
     }
 
     return 0;
 }
+
+int Screen::handleTextMessage(const MeshPacket *arg)
+{
+    if (showingNormalScreen) {
+        setFrames(); // Regen the list of screens (will show new text message)
+    }
+
+    return 0;
+}
+
 } // namespace graphics
