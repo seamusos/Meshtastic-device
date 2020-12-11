@@ -10,7 +10,7 @@
 #ifdef GPS_RX_PIN
 HardwareSerial _serial_gps_real(GPS_SERIAL_NUM);
 HardwareSerial *GPS::_serial_gps = &_serial_gps_real;
-#elif defined(NRF52840_XXAA)
+#elif defined(NRF52840_XXAA) || defined(NRF52833_XXAA)
 // Assume NRF52840
 HardwareSerial *GPS::_serial_gps = &Serial1;
 #else
@@ -25,15 +25,73 @@ uint8_t GPS::i2cAddress = 0;
 
 GPS *gps;
 
+/// Multiple GPS instances might use the same serial port (in sequence), but we can 
+/// only init that port once.
+static bool didSerialInit;
+
+bool GPS::setupGPS()
+{
+    if (_serial_gps && !didSerialInit) {
+        didSerialInit = true;
+        
+#ifdef GPS_RX_PIN
+        _serial_gps->begin(GPS_BAUDRATE, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+#else
+        _serial_gps->begin(GPS_BAUDRATE);
+#endif
+#ifndef NO_ESP32
+        _serial_gps->setRxBufferSize(2048); // the default is 256
+#endif
+    }
+
+    return true;
+}
+
 bool GPS::setup()
 {
+    // Master power for the GPS
+#ifdef PIN_GPS_EN
+    digitalWrite(PIN_GPS_EN, PIN_GPS_EN);
+    pinMode(PIN_GPS_EN, OUTPUT);
+#endif
+
+#ifdef PIN_GPS_RESET
+    digitalWrite(PIN_GPS_RESET, 1); // assert for 10ms
+    pinMode(PIN_GPS_RESET, OUTPUT);
+    delay(10);
+    digitalWrite(PIN_GPS_RESET, 0);
+#endif
+
     setAwake(true); // Wake GPS power before doing any init
     bool ok = setupGPS();
 
-    if (ok)
+    if (ok) {
         notifySleepObserver.observe(&notifySleep);
+        notifyDeepSleepObserver.observe(&notifyDeepSleep);
+    }
 
     return ok;
+}
+
+// Allow defining the polarity of the WAKE output.  default is active high
+#ifndef GPS_WAKE_ACTIVE
+#define GPS_WAKE_ACTIVE 1
+#endif
+
+void GPS::wake()
+{
+#ifdef PIN_GPS_WAKE
+    digitalWrite(PIN_GPS_WAKE, GPS_WAKE_ACTIVE);
+    pinMode(PIN_GPS_WAKE, OUTPUT);
+#endif
+}
+
+
+void GPS::sleep() {
+#ifdef PIN_GPS_WAKE
+    digitalWrite(PIN_GPS_WAKE, GPS_WAKE_ACTIVE ? 0 : 1);
+    pinMode(PIN_GPS_WAKE, OUTPUT);
+#endif
 }
 
 /// Record that we have a GPS
@@ -225,7 +283,19 @@ void GPS::forceWake(bool on)
 /// Prepare the GPS for the cpu entering deep or light sleep, expect to be gone for at least 100s of msecs
 int GPS::prepareSleep(void *unused)
 {
+    DEBUG_MSG("GPS prepare sleep!\n");
     forceWake(false);
+
+    return 0;
+}
+
+/// Prepare the GPS for the cpu entering deep or light sleep, expect to be gone for at least 100s of msecs
+int GPS::prepareDeepSleep(void *unused)
+{
+    DEBUG_MSG("GPS deep sleep!\n");
+
+    // For deep sleep we also want abandon any lock attempts (because we want minimum power)
+    setAwake(false);
 
     return 0;
 }

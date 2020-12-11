@@ -6,6 +6,7 @@
 #include "meshwifi/meshhttp.h"
 #include "target_specific.h"
 #include <DNSServer.h>
+#include <ESPmDNS.h>
 #include <WiFi.h>
 
 static void WiFiEvent(WiFiEvent_t event);
@@ -17,8 +18,8 @@ static WiFiServerPort *apiPort;
 
 uint8_t wifiDisconnectReason = 0;
 
-// Stores the last 4 of our hardware ID, to make finding the device for pairing easier
-static char ourHost[16];
+// Stores our hostname
+char ourHost[16];
 
 bool isWifiAvailable()
 {
@@ -29,9 +30,6 @@ bool isWifiAvailable()
     // strcpy(radioConfig.preferences.wifi_password, "");
 
     if (*wifiName && *wifiPsw) {
-
-        // Once every 10 seconds, try to reconnect.
-
         return 1;
     } else {
         return 0;
@@ -52,9 +50,11 @@ void deinitWifi()
         saving on the 2.4g transceiver.
     */
 
-    WiFi.mode(WIFI_MODE_NULL);
-    DEBUG_MSG("WiFi Turned Off\n");
-    // WiFi.printDiag(Serial);
+    if (isWifiAvailable()) {
+        WiFi.mode(WIFI_MODE_NULL);
+        DEBUG_MSG("WiFi Turned Off\n");
+        // WiFi.printDiag(Serial);
+    }
 }
 
 // Startup WiFi
@@ -63,6 +63,8 @@ void initWifi()
     if (isWifiAvailable() == 0) {
         return;
     }
+
+    createSSLCert();
 
     if (radioConfig.has_preferences) {
         const char *wifiName = radioConfig.preferences.wifi_ssid;
@@ -117,11 +119,22 @@ void initWifi()
                 }
             }
         }
+
+        if (!MDNS.begin("Meshtastic")) {
+            DEBUG_MSG("Error setting up MDNS responder!\n");
+
+            while (1) {
+                delay(1000);
+            }
+        }
+        DEBUG_MSG("mDNS responder started\n");
+        DEBUG_MSG("mDNS Host: Meshtastic.local\n");
+        MDNS.addService("http", "tcp", 80);
+        MDNS.addService("https", "tcp", 443);
+
     } else
         DEBUG_MSG("Not using WIFI\n");
 }
-
-
 
 static void initApiServer()
 {

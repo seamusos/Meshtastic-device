@@ -118,12 +118,21 @@ static void serialEnter()
 {
     setBluetoothEnable(false);
     screen->setOn(true);
+    screen->print("Using API...\n");
 }
 
 static void powerEnter()
 {
     screen->setOn(true);
     setBluetoothEnable(true);
+    screen->print("Powered...\n");
+}
+
+static void powerExit()
+{
+    screen->setOn(true);
+    setBluetoothEnable(true);
+    screen->print("Unpowered...\n");
 }
 
 static void onEnter()
@@ -140,6 +149,7 @@ static void onEnter()
             service.sendNetworkPing(displayedNodeNum, true); // Refresh the currently displayed node
         lastPingMs = now;
     }
+
 }
 
 static void screenPress()
@@ -156,7 +166,7 @@ State stateDARK(darkEnter, NULL, NULL, "DARK");
 State stateSERIAL(serialEnter, NULL, NULL, "SERIAL");
 State stateBOOT(bootEnter, NULL, NULL, "BOOT");
 State stateON(onEnter, NULL, NULL, "ON");
-State statePOWER(powerEnter, NULL, NULL, "POWER");
+State statePOWER(powerEnter, NULL, powerExit, "POWER");
 Fsm powerFSM(&stateBOOT);
 
 void PowerFSM_setup()
@@ -235,20 +245,24 @@ void PowerFSM_setup()
 
     powerFSM.add_timed_transition(&stateON, &stateDARK, getPref_screen_on_secs() * 1000, NULL, "Screen-on timeout");
 
-    powerFSM.add_timed_transition(&stateDARK, &stateNB, getPref_phone_timeout_secs() * 1000, NULL, "Phone timeout");
+    // On most boards we use light-sleep to be our main state, but on NRF52 we just stay in DARK
+    State *lowPowerState = &stateLS;
 
 #ifndef NRF52_SERIES
-    // We never enter light-sleep state on NRF52 (because the CPU uses so little power normally)
-    powerFSM.add_timed_transition(&stateNB, &stateLS, getPref_min_wake_secs() * 1000, NULL, "Min wake timeout");
+    // We never enter light-sleep or NB states on NRF52 (because the CPU uses so little power normally)
 
+    powerFSM.add_timed_transition(&stateDARK, &stateNB, getPref_phone_timeout_secs() * 1000, NULL, "Phone timeout");
+    powerFSM.add_timed_transition(&stateNB, &stateLS, getPref_min_wake_secs() * 1000, NULL, "Min wake timeout");
     powerFSM.add_timed_transition(&stateDARK, &stateLS, getPref_wait_bluetooth_secs() * 1000, NULL, "Bluetooth timeout");
+#else
+    lowPowerState = &stateDARK;
 #endif
 
     auto meshSds = getPref_mesh_sds_timeout_secs();
     if (meshSds != UINT32_MAX)
-        powerFSM.add_timed_transition(&stateLS, &stateSDS, meshSds * 1000, NULL, "mesh timeout");
+        powerFSM.add_timed_transition(lowPowerState, &stateSDS, meshSds * 1000, NULL, "mesh timeout");
     // removing for now, because some users don't even have phones
-    // powerFSM.add_timed_transition(&stateLS, &stateSDS, getPref_phone_sds_timeout_sec() * 1000, NULL, "phone
+    // powerFSM.add_timed_transition(lowPowerState, &stateSDS, getPref_phone_sds_timeout_sec() * 1000, NULL, "phone
     // timeout");
 
     powerFSM.run_machine(); // run one interation of the state machine, so we run our on enter tasks for the initial DARK state

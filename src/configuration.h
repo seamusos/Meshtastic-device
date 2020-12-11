@@ -31,9 +31,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 // If app version is not specified we assume we are not being invoked by the build script
 #ifndef APP_VERSION
-#error APP_VERSION, HW_VERSION, and HW_VERSION_countryname must be set by the build environment
-//#define APP_VERSION 0.0.0   // this def normally comes from build-all.sh
-//#define HW_VERSION 1.0 - US // normally comes from build-all.sh and contains the region code
+#error APP_VERSION must be set by the build environment
+#endif
+
+// If app version is not specified we assume we are not being invoked by the build script
+#ifndef HW_VERSION
+#error HW_VERSION, and HW_VERSION_countryname must be set by the build environment
 #endif
 
 // -----------------------------------------------------------------------------
@@ -139,6 +142,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // -----------------------------------------------------------------------------
 
 #define SSD1306_ADDRESS 0x3C
+#define ST7567_ADDRESS 0x3F
 
 // The SH1106 controller is almost, but not quite, the same as SSD1306
 // Define this if you know you have that controller or your "SSD1306" misbehaves.
@@ -146,7 +150,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 // Flip the screen upside down by default as it makes more sense on T-BEAM
 // devices. Comment this out to not rotate screen 180 degrees.
-#define FLIP_SCREEN_VERTICALLY
+#define SCREEN_FLIP_VERTICALLY
+
+// Define if screen should be mirrored left to right
+// #define SCREEN_MIRROR
 
 // -----------------------------------------------------------------------------
 // GPS
@@ -400,8 +407,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // Always include the SEGGER code on NRF52 - because useful for debugging
 #include "SEGGER_RTT.h"
 
+// The channel we send stdout data to
+#define SEGGER_STDOUT_CH 0
+
 // Debug printing to segger console
-#define SEGGER_MSG(...) SEGGER_RTT_printf(0, __VA_ARGS__)
+#define SEGGER_MSG(...) SEGGER_RTT_printf(SEGGER_STDOUT_CH, __VA_ARGS__)
 
 // If we are not on a NRF52840 (which has built in USB-ACM serial support) and we don't have serial pins hooked up, then we MUST
 // use SEGGER for debug output
@@ -430,3 +440,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #define GPS_POWER_CTRL_CH 3
 #define LORA_POWER_CTRL_CH 2
+
+// Default Bluetooth PIN
+#define defaultBLEPin 123456

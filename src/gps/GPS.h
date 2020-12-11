@@ -30,6 +30,7 @@ class GPS : private concurrency::OSThread
     uint8_t numSatellites = 0;
 
     CallbackObserver<GPS, void *> notifySleepObserver = CallbackObserver<GPS, void *>(this, &GPS::prepareSleep);
+    CallbackObserver<GPS, void *> notifyDeepSleepObserver = CallbackObserver<GPS, void *>(this, &GPS::prepareDeepSleep);
 
   public:
     /** If !NULL we will use this serial port to construct our GPS */
@@ -72,13 +73,13 @@ class GPS : private concurrency::OSThread
 
   protected:
     /// Do gps chipset specific init, return true for success
-    virtual bool setupGPS() = 0;
+    virtual bool setupGPS();
 
     /// If possible force the GPS into sleep/low power mode
-    virtual void sleep() {}
+    virtual void sleep();
 
     /// wake the GPS into normal operation mode
-    virtual void wake() {}
+    virtual void wake();
 
     /** Subclasses should look for serial rx characters here and feed it to their GPS parser
      *
@@ -114,6 +115,10 @@ class GPS : private concurrency::OSThread
     /// Prepare the GPS for the cpu entering deep or light sleep, expect to be gone for at least 100s of msecs
     /// always returns 0 to indicate okay to sleep
     int prepareSleep(void *unused);
+
+    /// Prepare the GPS for the cpu entering deep sleep, expect to be gone for at least 100s of msecs
+    /// always returns 0 to indicate okay to sleep
+    int prepareDeepSleep(void *unused);
 
     /**
      * Switch the GPS into a mode where we are actively looking for a lock, or alternatively switch GPS into a low power mode

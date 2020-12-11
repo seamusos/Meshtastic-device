@@ -11,6 +11,7 @@
 // #include "rom/rtc.h"
 #include "DSRRouter.h"
 // #include "debug.h"
+#include "FSCommon.h"
 #include "RTC.h"
 #include "SPILock.h"
 #include "concurrency/OSThread.h"
@@ -55,7 +56,9 @@ meshtastic::GPSStatus *gpsStatus = new meshtastic::GPSStatus();
 // Global Node status
 meshtastic::NodeStatus *nodeStatus = new meshtastic::NodeStatus();
 
-bool ssd1306_found;
+/// The I2C address of our display (if found)
+uint8_t screen_found;
+
 bool axp192_found;
 
 Router *router = NULL; // Users of router don't care what sort of subclass implements that API
@@ -80,8 +83,12 @@ void scanI2Cdevice(void)
             nDevices++;
 
             if (addr == SSD1306_ADDRESS) {
-                ssd1306_found = true;
+                screen_found = addr;
                 DEBUG_MSG("ssd1306 display found\n");
+            }
+            if (addr == ST7567_ADDRESS) {
+                screen_found = addr;
+                DEBUG_MSG("st7567 display found\n");
             }
 #ifdef AXP192_SLAVE_ADDRESS
             if (addr == AXP192_SLAVE_ADDRESS) {
@@ -136,7 +143,8 @@ class PowerFSMThread : public OSThread
 
         /// If we are in power state we force the CPU to wake every 10ms to check for serial characters (we don't yet wake
         /// cpu for serial rx - FIXME)
-        canSleep = (powerFSM.getState() != &statePOWER);
+        auto state = powerFSM.getState();
+        canSleep = (state != &statePOWER) && (state != &stateSERIAL);
 
         return 10;
     }
@@ -168,19 +176,35 @@ class ButtonThread : public OSThread
 #endif
 
   public:
+    static uint32_t longPressTime;
+
     // callback returns the period for the next callback invocation (or 0 if we should no longer be called)
     ButtonThread() : OSThread("Button")
     {
 #ifdef BUTTON_PIN
         userButton = OneButton(BUTTON_PIN, true, true);
+#ifdef INPUT_PULLUP_SENSE
+        // Some platforms (nrf52) have a SENSE variant which allows wake from sleep - override what OneButton did
+        pinMode(BUTTON_PIN, INPUT_PULLUP_SENSE);
+#endif
         userButton.attachClick(userButtonPressed);
         userButton.attachDuringLongPress(userButtonPressedLong);
+        userButton.attachDoubleClick(userButtonDoublePressed);
+        userButton.attachLongPressStart(userButtonPressedLongStart);
+        userButton.attachLongPressStop(userButtonPressedLongStop);
         wakeOnIrq(BUTTON_PIN, FALLING);
 #endif
 #ifdef BUTTON_PIN_ALT
         userButtonAlt = OneButton(BUTTON_PIN_ALT, true, true);
+#ifdef INPUT_PULLUP_SENSE
+        // Some platforms (nrf52) have a SENSE variant which allows wake from sleep - override what OneButton did
+        pinMode(BUTTON_PIN_ALT, INPUT_PULLUP_SENSE);
+#endif
         userButtonAlt.attachClick(userButtonPressed);
-        userButton.attachDuringLongPress(userButtonPressedLong);
+        userButtonAlt.attachDuringLongPress(userButtonPressedLong);
+        userButtonAlt.attachDoubleClick(userButtonDoublePressed);
+        userButtonAlt.attachLongPressStart(userButtonPressedLongStart);
+        userButtonAlt.attachLongPressStop(userButtonPressedLongStop);
         wakeOnIrq(BUTTON_PIN_ALT, FALLING);
 #endif
     }
@@ -197,9 +221,10 @@ class ButtonThread : public OSThread
 #endif
 #ifdef BUTTON_PIN_ALT
         userButtonAlt.tick();
-        canSleep &= userButton.isIdle();
+        canSleep &= userButtonAlt.isIdle();
 #endif
-        // if(!canSleep) DEBUG_MSG("Supressing sleep!\n");
+        // if (!canSleep) DEBUG_MSG("Supressing sleep!\n");
+        // else DEBUG_MSG("sleep ok\n");
 
         return 5;
     }
@@ -210,11 +235,46 @@ class ButtonThread : public OSThread
         // DEBUG_MSG("press!\n");
         powerFSM.trigger(EVENT_PRESS);
     }
-    static void userButtonPressedLong() { screen->adjustBrightness(); }
+    static void userButtonPressedLong()
+    {
+        // DEBUG_MSG("Long press!\n");
+        screen->adjustBrightness();
+
+        // If user button is held down for 10 seconds, shutdown the device.
+        if (millis() - longPressTime > 10 * 1000) {
+#ifdef TBEAM_V10
+            if (axp192_found == true) {
+                power->shutdown();
+            }
+#endif
+        } else {
+            //DEBUG_MSG("Long press %u\n", (millis() - longPressTime));
+        }
+    }
+
+    static void userButtonDoublePressed()
+    {
+#ifndef NO_ESP32
+        disablePin();
+#endif
+    }
+
+    static void userButtonPressedLongStart()
+    {
+        DEBUG_MSG("Long press start!\n");
+        longPressTime = millis();
+    }
+
+    static void userButtonPressedLongStop()
+    {
+        DEBUG_MSG("Long press stop!\n");
+        longPressTime = 0;
+    }
 };
 
 static Periodic *ledPeriodic;
 static OSThread *powerFSMthread, *buttonThread;
+uint32_t ButtonThread::longPressTime = 0;
 
 RadioInterface *rIf = NULL;
 
@@ -233,6 +293,10 @@ JsonArray root = jsonBuffer.to<JsonArray>();
 
 void setup()
 {
+#ifdef SEGGER_STDOUT_CH
+    SEGGER_RTT_ConfigUpBuffer(SEGGER_STDOUT_CH, NULL, NULL, 1024, SEGGER_RTT_MODE_NO_BLOCK_TRIM);
+#endif
+
 #ifdef USE_SEGGER
     SEGGER_RTT_ConfigUpBuffer(0, NULL, NULL, 0, SEGGER_RTT_MODE_NO_BLOCK_TRIM);
 #endif
@@ -258,6 +322,8 @@ void setup()
 
     ledPeriodic = new Periodic("Blink", ledBlinker);
 
+    fsInit();
+
     router = new DSRRouter();
 
 #ifdef I2C_SDA
@@ -265,13 +331,21 @@ void setup()
 #else
     Wire.begin();
 #endif
-    // i2c still busted on new board
-#ifndef ARDUINO_NRF52840_PPR
-    scanI2Cdevice();
+
+#ifdef PIN_LCD_RESET
+    // FIXME - move this someplace better, LCD is at address 0x3F
+    pinMode(PIN_LCD_RESET, OUTPUT);
+    digitalWrite(PIN_LCD_RESET, 0);
+    delay(1);
+    digitalWrite(PIN_LCD_RESET, 1);
+    delay(1);
 #endif
+
+    scanI2Cdevice();
 
     // Buttons & LED
     buttonThread = new ButtonThread();
+
 #ifdef LED_PIN
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, 1 ^ LED_INVERTED); // turn on for now
@@ -283,7 +357,7 @@ void setup()
 #ifndef NO_ESP32
     // Don't init display if we don't have one or we are waking headless due to a timer event
     if (wakeCause == ESP_SLEEP_WAKEUP_TIMER)
-        ssd1306_found = false; // forget we even have the hardware
+        screen_found = 0; // forget we even have the hardware
 
     esp32Setup();
 #endif
@@ -309,54 +383,57 @@ void setup()
 #endif
 
     // Initialize the screen first so we can show the logo while we start up everything else.
-    screen = new graphics::Screen(SSD1306_ADDRESS);
-#if defined(ST7735_CS) || defined(HAS_EINK)
-    screen->setup();
-#else
-    if (ssd1306_found)
-        screen->setup();
-#endif
-
-    screen->print("Started...\n");
+    screen = new graphics::Screen(screen_found);
 
     readFromRTC(); // read the main CPU RTC at first (in case we can't get GPS time)
 
-// If we know we have a L80 GPS, don't try UBLOX
-#ifndef L80_RESET
+    // If we don't have bidirectional comms, we can't even try talking to UBLOX
+    UBloxGPS *ublox = NULL;
+#ifdef GPS_TX_PIN
     // Init GPS - first try ublox
-    auto ublox = new UBloxGPS();
+    ublox = new UBloxGPS();
     gps = ublox;
     if (!gps->setup()) {
         DEBUG_MSG("ERROR: No UBLOX GPS found\n");
 
         delete ublox;
         gps = ublox = NULL;
+    }
+#endif
 
-        if (GPS::_serial_gps) {
-            // Some boards might have only the TX line from the GPS connected, in that case, we can't configure it at all.  Just
-            // assume NMEA at 9600 baud.
-            // dumb NMEA access only work for serial GPSes)
-            DEBUG_MSG("Hoping that NMEA might work\n");
+    if (!gps && GPS::_serial_gps) {
+        // Some boards might have only the TX line from the GPS connected, in that case, we can't configure it at all.  Just
+        // assume NMEA at 9600 baud.
+        // dumb NMEA access only work for serial GPSes)
+        DEBUG_MSG("Hoping that NMEA might work\n");
 
 #ifdef HAS_AIR530_GPS
-            gps = new Air530GPS();
+        gps = new Air530GPS();
 #else
-            gps = new NMEAGPS();
+        gps = new NMEAGPS();
 #endif
-            gps->setup();
-        }
+        gps->setup();
     }
-#else
-    gps = new NMEAGPS();
-    gps->setup();
-#endif
+
     if (gps)
         gpsStatus->observe(&gps->newStatus);
     else
         DEBUG_MSG("Warning: No GPS found - running without GPS\n");
+
     nodeStatus->observe(&nodeDB.newStatus);
 
     service.init();
+
+    // Don't call screen setup until after nodedb is setup (because we need
+    // the current region name)
+#if defined(ST7735_CS) || defined(HAS_EINK)
+    screen->setup();
+#else
+    if (screen_found)
+        screen->setup();
+#endif
+
+    screen->print("Started...\n");
 
     // We have now loaded our saved preferences from flash
 

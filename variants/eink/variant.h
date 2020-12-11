@@ -205,9 +205,13 @@ External serial flash WP25R1635FZUIL0
 #define PIN_EINK_MOSI (0 + 29) // also called SDI
 
 // Controls power for the eink display - Board power is enabled either by VBUS from USB or the CPU asserting PWR_ON
+// FIXME - I think this is actually just the board power enable - it enables power to the CPU also 
 #define PIN_EINK_PWR_ON (0 + 12)
 
 #define HAS_EINK
+
+// No screen wipes on eink
+#define SCREEN_TRANSITION_MSECS 0
 
 #define PIN_SPI1_MISO                                                                                                            \
     (32 + 7) // FIXME not really needed, but for now the SPI code requires something to be defined, pick an used GPIO
@@ -239,7 +243,7 @@ External serial flash WP25R1635FZUIL0
 #define PIN_SPI_SCK (0 + 19)
 
 // To debug via the segger JLINK console rather than the CDC-ACM serial device
-#define USE_SEGGER
+// #define USE_SEGGER
 
 #ifdef __cplusplus
 }

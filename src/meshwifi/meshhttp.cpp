@@ -2,33 +2,78 @@
 #include "NodeDB.h"
 #include "configuration.h"
 #include "main.h"
+#include "meshhttpStatic.h"
 #include "meshwifi/meshwifi.h"
+#include "sleep.h"
+#include <HTTPBodyParser.hpp>
+#include <HTTPMultipartBodyParser.hpp>
+#include <HTTPURLEncodedBodyParser.hpp>
+#include <SPIFFS.h>
 #include <WebServer.h>
 #include <WiFi.h>
 
-WebServer webserver(80);
+// Persistant Data Storage
+#include <Preferences.h>
+Preferences prefs;
 
-// Maximum number of messages for chat history. Don't make this too big -- it'll use a
-//   lot of memory!
-const uint16_t maxMessages = 50;
+/*
+  Including the esp32_https_server library will trigger a compile time error. I've
+  tracked it down to a reoccurrance of this bug:
+    https://gcc.gnu.org/bugzilla/show_bug.cgi?id=57824
+  The work around is described here:
+    https://forums.xilinx.com/t5/Embedded-Development-Tools/Error-with-Standard-Libaries-in-Zynq/td-p/450032
 
-struct message_t {
-    char sender[10];
-    char message[250];
-    int32_t gpsLat;
-    int32_t gpsLong;
-    uint32_t time;
-    bool fromMe;
-};
+  Long story short is we need "#undef str" before including the esp32_https_server.
+    - Jm Casler (jm@casler.org) Oct 2020
+*/
+#undef str
 
-struct messages_t {
-    message_t history[maxMessages];
-};
+// Includes for the https server
+//   https://github.com/fhessel/esp32_https_server
+#include <HTTPRequest.hpp>
+#include <HTTPResponse.hpp>
+#include <HTTPSServer.hpp>
+#include <HTTPServer.hpp>
+#include <SSLCert.hpp>
 
-messages_t messages_history;
+// The HTTPS Server comes in a separate namespace. For easier use, include it here.
+using namespace httpsserver;
 
-String something = "";
-String sender = "";
+SSLCert *cert;
+HTTPSServer *secureServer;
+HTTPServer *insecureServer;
+
+// Our API to handle messages to and from the radio.
+HttpAPI webAPI;
+
+// Declare some handler functions for the various URLs on the server
+void handleAPIv1FromRadio(HTTPRequest *req, HTTPResponse *res);
+void handleAPIv1ToRadio(HTTPRequest *req, HTTPResponse *res);
+void handleStyleCSS(HTTPRequest *req, HTTPResponse *res);
+void handleHotspot(HTTPRequest *req, HTTPResponse *res);
+void handleFavicon(HTTPRequest *req, HTTPResponse *res);
+void handleRoot(HTTPRequest *req, HTTPResponse *res);
+void handleStaticBrowse(HTTPRequest *req, HTTPResponse *res);
+void handleStaticPost(HTTPRequest *req, HTTPResponse *res);
+void handleStatic(HTTPRequest *req, HTTPResponse *res);
+void handle404(HTTPRequest *req, HTTPResponse *res);
+void handleFormUpload(HTTPRequest *req, HTTPResponse *res);
+
+void middlewareSpeedUp240(HTTPRequest *req, HTTPResponse *res, std::function<void()> next);
+void middlewareSpeedUp160(HTTPRequest *req, HTTPResponse *res, std::function<void()> next);
+void middlewareSession(HTTPRequest *req, HTTPResponse *res, std::function<void()> next);
+
+bool isWebServerReady = 0;
+bool isCertReady = 0;
+
+uint32_t timeSpeedUp = 0;
+
+// We need to specify some content-type mapping, so the resources get delivered with the
+// right content type and are displayed correctly in the browser
+char contentTypes[][2][32] = {{".txt", "text/plain"}, {".html", "text/html"},        {".js", "text/javascript"},
+                              {".png", "image/png"},  {".jpg", "image/jpg"},         {".gz", "application/gzip"},
+                              {".gif", "image/gif"},  {".json", "application/json"}, {".css", "text/css"},
+                              {"", ""}};
 
 void handleWebResponse()
 {
@@ -36,82 +81,646 @@ void handleWebResponse()
         return;
     }
 
-    // We're going to handle the DNS responder here so it
-    // will be ignored by the NRF boards.
-    handleDNSResponse();
+    if (isWebServerReady) {
+        // We're going to handle the DNS responder here so it
+        // will be ignored by the NRF boards.
+        handleDNSResponse();
 
-    webserver.handleClient();
+        secureServer->loop();
+        insecureServer->loop();
+    }
+
+    /*
+        Slow down the CPU if we have not received a request within the last few
+        seconds.
+    */
+    if (millis() - timeSpeedUp >= (25 * 1000)) {
+        setCpuFrequencyMhz(80);
+        timeSpeedUp = millis();
+    }
+}
+
+void taskCreateCert(void *parameter)
+{
+
+    prefs.begin("MeshtasticHTTPS", false);
+
+    // Delete the saved certs
+    if (0) {
+        DEBUG_MSG("Deleting any saved SSL keys ...\n");
+        // prefs.clear();
+        prefs.remove("PK");
+        prefs.remove("cert");
+    }
+
+    size_t pkLen = prefs.getBytesLength("PK");
+    size_t certLen = prefs.getBytesLength("cert");
+
+    DEBUG_MSG("Checking if we have a previously saved SSL Certificate.\n");
+
+    if (pkLen && certLen) {
+        DEBUG_MSG("Existing SSL Certificate found!\n");
+    } else {
+        DEBUG_MSG("Creating the certificate. This may take a while. Please wait...\n");
+        cert = new SSLCert();
+        // disableCore1WDT();
+        int createCertResult = createSelfSignedCert(*cert, KEYSIZE_2048, "CN=meshtastic.local,O=Meshtastic,C=US",
+                                                    "20190101000000", "20300101000000");
+        // enableCore1WDT();
+
+        if (createCertResult != 0) {
+            DEBUG_MSG("Creating the certificate failed\n");
+
+            // Serial.printf("Creating the certificate failed. Error Code = 0x%02X, check SSLCert.hpp for details",
+            //              createCertResult);
+            // while (true)
+            //    delay(500);
+        } else {
+            DEBUG_MSG("Creating the certificate was successful\n");
+
+            DEBUG_MSG("Created Private Key: %d Bytes\n", cert->getPKLength());
+            // for (int i = 0; i < cert->getPKLength(); i++)
+            //  Serial.print(cert->getPKData()[i], HEX);
+            // Serial.println();
+
+            DEBUG_MSG("Created Certificate: %d Bytes\n", cert->getCertLength());
+            // for (int i = 0; i < cert->getCertLength(); i++)
+            //  Serial.print(cert->getCertData()[i], HEX);
+            // Serial.println();
+
+            prefs.putBytes("PK", (uint8_t *)cert->getPKData(), cert->getPKLength());
+            prefs.putBytes("cert", (uint8_t *)cert->getCertData(), cert->getCertLength());
+        }
+    }
+
+    isCertReady = 1;
+    vTaskDelete(NULL);
+}
+
+void createSSLCert()
+{
+
+    if (isWifiAvailable() == 0) {
+        return;
+    }
+
+    // Create a new process just to handle creating the cert.
+    //   This is a workaround for Bug: https://github.com/fhessel/esp32_https_server/issues/48
+    //  jm@casler.org (Oct 2020)
+    xTaskCreate(taskCreateCert, /* Task function. */
+                "createCert",   /* String with name of task. */
+                16384,          /* Stack size in bytes. */
+                NULL,           /* Parameter passed as input of the task */
+                16,             /* Priority of the task. */
+                NULL);          /* Task handle. */
+
+    DEBUG_MSG("Waiting for SSL Cert to be generated.\n");
+    if (isCertReady) {
+        DEBUG_MSG(".\n");
+        delayMicroseconds(1000);
+    }
+    DEBUG_MSG("SSL Cert Ready!\n");
 }
 
 void initWebServer()
 {
-    webserver.onNotFound(handleNotFound);
-    webserver.on("/json/chat/send/channel", handleJSONChatHistory);
-    webserver.on("/json/chat/send/user", handleJSONChatHistory);
-    webserver.on("/json/chat/history/channel", handleJSONChatHistory);
-    webserver.on("/json/chat/history/dummy", handleJSONChatHistoryDummy);
-    webserver.on("/json/chat/history/user", handleJSONChatHistory);
-    webserver.on("/json/stats", handleJSONChatHistory);
-    webserver.on("/hotspot-detect.html", handleHotspot);
-    webserver.on("/css/style.css", handleStyleCSS);
-    webserver.on("/scripts/script.js", handleScriptsScriptJS);
-    webserver.on("/", handleRoot);
-    webserver.begin();
-}
+    DEBUG_MSG("Initializing Web Server ...\n");
 
-void handleJSONChatHistory()
-{
-    int i;
+    prefs.begin("MeshtasticHTTPS", false);
 
-    String out = "";
-    out += "{\n";
-    out += "  \"data\" : {\n";
-    out += "    \"chat\" : ";
-    out += "[";
-    out += "\"" + sender + "\"";
-    out += ",";
-    out += "\"" + something + "\"";
-    out += "]\n";
+    size_t pkLen = prefs.getBytesLength("PK");
+    size_t certLen = prefs.getBytesLength("cert");
 
-    for (i = 0; i < maxMessages; i++) {
-        out += "[";
-        out += "\"" + String(messages_history.history[i].sender) + "\"";
-        out += ",";
-        out += "\"" + String(messages_history.history[i].message) + "\"";
-        out += "]\n";
+    DEBUG_MSG("Checking if we have a previously saved SSL Certificate.\n");
+
+    if (pkLen && certLen) {
+
+        uint8_t *pkBuffer = new uint8_t[pkLen];
+        prefs.getBytes("PK", pkBuffer, pkLen);
+
+        uint8_t *certBuffer = new uint8_t[certLen];
+        prefs.getBytes("cert", certBuffer, certLen);
+
+        cert = new SSLCert(certBuffer, certLen, pkBuffer, pkLen);
+
+        DEBUG_MSG("Retrieved Private Key: %d Bytes\n", cert->getPKLength());
+        // DEBUG_MSG("Retrieved Private Key: " + String(cert->getPKLength()) + " Bytes");
+        // for (int i = 0; i < cert->getPKLength(); i++)
+        //  Serial.print(cert->getPKData()[i], HEX);
+        // Serial.println();
+
+        DEBUG_MSG("Retrieved Certificate: %d Bytes\n", cert->getCertLength());
+        // for (int i = 0; i < cert->getCertLength(); i++)
+        //  Serial.print(cert->getCertData()[i], HEX);
+        // Serial.println();
+    } else {
+        DEBUG_MSG("Web Server started without SSL keys! How did this happen?\n");
     }
 
-    out += "\n";
-    out += "  }\n";
-    out += "}\n";
+    // We can now use the new certificate to setup our server as usual.
+    secureServer = new HTTPSServer(cert);
+    insecureServer = new HTTPServer();
 
-    webserver.send(200, "application/json", out);
-    return;
+    // For every resource available on the server, we need to create a ResourceNode
+    // The ResourceNode links URL and HTTP method to a handler function
+
+    ResourceNode *nodeAPIv1ToRadioOptions = new ResourceNode("/api/v1/toradio", "OPTIONS", &handleAPIv1ToRadio);
+    ResourceNode *nodeAPIv1ToRadio = new ResourceNode("/api/v1/toradio", "PUT", &handleAPIv1ToRadio);
+    ResourceNode *nodeAPIv1FromRadio = new ResourceNode("/api/v1/fromradio", "GET", &handleAPIv1FromRadio);
+    ResourceNode *nodeHotspot = new ResourceNode("/hotspot-detect.html", "GET", &handleHotspot);
+    ResourceNode *nodeFavicon = new ResourceNode("/favicon.ico", "GET", &handleFavicon);
+    ResourceNode *nodeRoot = new ResourceNode("/", "GET", &handleRoot);
+    ResourceNode *nodeStaticBrowse = new ResourceNode("/static", "GET", &handleStaticBrowse);
+    ResourceNode *nodeStaticPOST = new ResourceNode("/static", "POST", &handleStaticPost);
+    ResourceNode *nodeStatic = new ResourceNode("/static/*", "GET", &handleStatic);
+    ResourceNode *node404 = new ResourceNode("", "GET", &handle404);
+    ResourceNode *nodeFormUpload = new ResourceNode("/upload", "POST", &handleFormUpload);
+
+    // Secure nodes
+    secureServer->registerNode(nodeAPIv1ToRadioOptions);
+    secureServer->registerNode(nodeAPIv1ToRadio);
+    secureServer->registerNode(nodeAPIv1FromRadio);
+    secureServer->registerNode(nodeHotspot);
+    secureServer->registerNode(nodeFavicon);
+    secureServer->registerNode(nodeRoot);
+    secureServer->registerNode(nodeStaticBrowse);
+    secureServer->registerNode(nodeStaticPOST);
+    secureServer->registerNode(nodeStatic);
+    secureServer->setDefaultNode(node404);
+    secureServer->setDefaultNode(nodeFormUpload);
+
+    secureServer->addMiddleware(&middlewareSpeedUp240);
+
+    // Insecure nodes
+    insecureServer->registerNode(nodeAPIv1ToRadioOptions);
+    insecureServer->registerNode(nodeAPIv1ToRadio);
+    insecureServer->registerNode(nodeAPIv1FromRadio);
+    insecureServer->registerNode(nodeHotspot);
+    insecureServer->registerNode(nodeFavicon);
+    insecureServer->registerNode(nodeRoot);
+    insecureServer->registerNode(nodeStaticBrowse);
+    insecureServer->registerNode(nodeStaticPOST);
+    insecureServer->registerNode(nodeStatic);
+    insecureServer->setDefaultNode(node404);
+    insecureServer->setDefaultNode(nodeFormUpload);
+
+    insecureServer->addMiddleware(&middlewareSpeedUp160);
+
+    DEBUG_MSG("Starting Web Servers...\n");
+    secureServer->start();
+    insecureServer->start();
+    if (secureServer->isRunning() && insecureServer->isRunning()) {
+        DEBUG_MSG("HTTP and HTTPS Web Servers Ready! :-) \n");
+        isWebServerReady = 1;
+    } else {
+        DEBUG_MSG("HTTP and HTTPS Web Servers Failed! ;-( \n");
+    }
 }
 
-void handleNotFound()
+void middlewareSpeedUp240(HTTPRequest *req, HTTPResponse *res, std::function<void()> next)
 {
-    String message = "";
-    message += "File Not Found\n\n";
-    message += "URI: ";
-    message += webserver.uri();
-    message += "\nMethod: ";
-    message += (webserver.method() == HTTP_GET) ? "GET" : "POST";
-    message += "\nArguments: ";
-    message += webserver.args();
-    message += "\n";
+    // We want to print the response status, so we need to call next() first.
+    next();
 
-    for (uint8_t i = 0; i < webserver.args(); i++) {
-        message += " " + webserver.argName(i) + ": " + webserver.arg(i) + "\n";
+    setCpuFrequencyMhz(240);
+    timeSpeedUp = millis();
+}
+
+void middlewareSpeedUp160(HTTPRequest *req, HTTPResponse *res, std::function<void()> next)
+{
+    // We want to print the response status, so we need to call next() first.
+    next();
+
+    // If the frequency is 240mhz, we have recently gotten a HTTPS request.
+    //   In that case, leave the frequency where it is and just update the
+    //   countdown timer (timeSpeedUp).
+    if (getCpuFrequencyMhz() != 240) {
+        setCpuFrequencyMhz(160);
     }
-    Serial.println(message);
-    webserver.send(404, "text/plain", message);
+    timeSpeedUp = millis();
+}
+
+void handleStaticPost(HTTPRequest *req, HTTPResponse *res)
+{
+    // Assume POST request. Contains submitted data.
+    res->println("<html><head><title>File Edited</title><meta http-equiv=\"refresh\" content=\"3;url=/static\" "
+                 "/><head><body><h1>File Edited</h1>");
+
+    // The form is submitted with the x-www-form-urlencoded content type, so we need the
+    // HTTPURLEncodedBodyParser to read the fields.
+    // Note that the content of the file's content comes from a <textarea>, so we
+    // can use the URL encoding here, since no file upload from an <input type="file"
+    // is involved.
+    HTTPURLEncodedBodyParser parser(req);
+
+    // The bodyparser will consume the request body. That means you can iterate over the
+    // fields only ones. For that reason, we need to create variables for all fields that
+    // we expect. So when parsing is done, you can process the field values from your
+    // temporary variables.
+    std::string filename;
+    bool savedFile = false;
+
+    // Iterate over the fields from the request body by calling nextField(). This function
+    // will update the field name and value of the body parsers. If the last field has been
+    // reached, it will return false and the while loop stops.
+    while (parser.nextField()) {
+        // Get the field name, so that we can decide what the value is for
+        std::string name = parser.getFieldName();
+
+        if (name == "filename") {
+            // Read the filename from the field's value, add the /public prefix and store it in
+            // the filename variable.
+            char buf[512];
+            size_t readLength = parser.read((byte *)buf, 512);
+            // filename = std::string("/public/") + std::string(buf, readLength);
+            filename = std::string(buf, readLength);
+
+        } else if (name == "content") {
+            // Browsers must return the fields in the order that they are placed in
+            // the HTML form, so if the broweser behaves correctly, this condition will
+            // never be true. We include it for safety reasons.
+            if (filename == "") {
+                res->println("<p>Error: form contained content before filename.</p>");
+                break;
+            }
+
+            // With parser.read() and parser.endOfField(), we can stream the field content
+            // into a buffer. That allows handling arbitrarily-sized field contents. Here,
+            // we use it and write the file contents directly to the SPIFFS:
+            size_t fieldLength = 0;
+            File file = SPIFFS.open(filename.c_str(), "w");
+            savedFile = true;
+            while (!parser.endOfField()) {
+                byte buf[512];
+                size_t readLength = parser.read(buf, 512);
+                file.write(buf, readLength);
+                fieldLength += readLength;
+            }
+            file.close();
+            res->printf("<p>Saved %d bytes to %s</p>", int(fieldLength), filename.c_str());
+
+        } else {
+            res->printf("<p>Unexpected field %s</p>", name.c_str());
+        }
+    }
+    if (!savedFile) {
+        res->println("<p>No file to save...</p>");
+    }
+    res->println("</body></html>");
+}
+
+void handleStaticBrowse(HTTPRequest *req, HTTPResponse *res)
+{
+    // Get access to the parameters
+    ResourceParameters *params = req->getParams();
+    std::string paramValDelete;
+    std::string paramValEdit;
+
+    // Set a default content type
+    res->setHeader("Content-Type", "text/html");
+
+    if (params->getQueryParameter("delete", paramValDelete)) {
+        std::string pathDelete = "/" + paramValDelete;
+        if (SPIFFS.remove(pathDelete.c_str())) {
+            Serial.println(pathDelete.c_str());
+            res->println("<html><head><meta http-equiv=\"refresh\" content=\"3;url=/static\" /><title>File "
+                         "deleted!</title></head><body><h1>File deleted!</h1>");
+            res->println("<meta http-equiv=\"refresh\" content=\"2;url=/static\" />\n");
+            res->println("</body></html>");
+
+            return;
+        } else {
+            Serial.println(pathDelete.c_str());
+            res->println("<html><head><meta http-equiv=\"refresh\" content=\"3;url=/static\" /><title>Error deleteing "
+                         "file!</title></head><body><h1>Error deleteing file!</h1>");
+            res->println("Error deleteing file!<br>");
+
+            return;
+        }
+    }
+
+    if (params->getQueryParameter("edit", paramValEdit)) {
+        std::string pathEdit = "/" + paramValEdit;
+        res->println("<html><head><title>Edit "
+                     "file</title></head><body><h1>Edit file - ");
+
+        res->println(pathEdit.c_str());
+
+        res->println("</h1>");
+        res->println("<form method=post action=/static enctype=application/x-www-form-urlencoded>");
+        res->printf("<input name=\"filename\" type=\"hidden\" value=\"%s\">", pathEdit.c_str());
+        res->print("<textarea id=id name=content rows=20 cols=80>");
+
+        // Try to open the file from SPIFFS
+        File file = SPIFFS.open(pathEdit.c_str());
+
+        if (file.available()) {
+            // Read the file from SPIFFS and write it to the HTTP response body
+            size_t length = 0;
+            do {
+                char buffer[256];
+                length = file.read((uint8_t *)buffer, 256);
+                std::string bufferString(buffer, length);
+
+                // Escape gt and lt
+                replaceAll(bufferString, "<", "&lt;");
+                replaceAll(bufferString, ">", "&gt;");
+
+                res->write((uint8_t *)bufferString.c_str(), bufferString.size());
+            } while (length > 0);
+        } else {
+            res->println("Error: File not found");
+        }
+
+        res->println("</textarea><br>");
+        res->println("<input type=submit value=Submit>");
+        res->println("</form>");
+        res->println("</body></html>");
+
+        return;
+    }
+
+    res->println("<h2>Upload new file</h2>");
+    res->println("<p><b>*** This interface is experimental ***</b></p>");
+    res->println("<p>This form allows you to upload files. Keep your filenames very short and files small. Big filenames and big "
+                 "files are a known problem.</p>");
+    res->println("<form method=\"POST\" action=\"/upload\" enctype=\"multipart/form-data\">");
+    res->println("file: <input type=\"file\" name=\"file\"><br>");
+    res->println("<input type=\"submit\" value=\"Upload\">");
+    res->println("</form>");
+
+    res->println("<h2>All Files</h2>");
+
+    File root = SPIFFS.open("/");
+    if (root.isDirectory()) {
+        res->println("<script type=\"text/javascript\">function confirm_delete() {return confirm('Are you sure?');}</script>");
+
+        res->println("<table>");
+        res->println("<tr>");
+        res->println("<td>File");
+        res->println("</td>");
+        res->println("<td>Size");
+        res->println("</td>");
+        res->println("<td colspan=2>Actions");
+        res->println("</td>");
+        res->println("</tr>");
+
+        File file = root.openNextFile();
+        while (file) {
+            String filePath = String(file.name());
+            if (filePath.indexOf("/static") == 0) {
+                res->println("<tr>");
+                res->println("<td>");
+
+                if (String(file.name()).substring(1).endsWith(".gz")) {
+                    String modifiedFile = String(file.name()).substring(1);
+                    modifiedFile.remove((modifiedFile.length() - 3), 3);
+                    res->print("<a href=\"" + modifiedFile + "\">" + String(file.name()).substring(1) + "</a>");
+                } else {
+                    res->print("<a href=\"" + String(file.name()).substring(1) + "\">" + String(file.name()).substring(1) +
+                               "</a>");
+                }
+                res->println("</td>");
+                res->println("<td>");
+                res->print(String(file.size()));
+                res->println("</td>");
+                res->println("<td>");
+                res->print("<a href=\"/static?delete=" + String(file.name()).substring(1) +
+                           "\" onclick=\"return confirm_delete()\">Delete</a> ");
+                res->println("</td>");
+                res->println("<td>");
+                if (!String(file.name()).substring(1).endsWith(".gz")) {
+                    res->print("<a href=\"/static?edit=" + String(file.name()).substring(1) + "\">Edit</a>");
+                }
+                res->println("</td>");
+                res->println("</tr>");
+            }
+
+            file = root.openNextFile();
+        }
+        res->println("</table>");
+
+        res->print("<br>");
+        // res->print("Total : " + String(SPIFFS.totalBytes()) + " Bytes<br>");
+        res->print("Used : " + String(SPIFFS.usedBytes()) + " Bytes<br>");
+        res->print("Free : " + String(SPIFFS.totalBytes() - SPIFFS.usedBytes()) + " Bytes<br>");
+    }
+}
+
+void handleStatic(HTTPRequest *req, HTTPResponse *res)
+{
+    // Get access to the parameters
+    ResourceParameters *params = req->getParams();
+
+
+    std::string parameter1;
+    // Print the first parameter value
+    if (params->getPathParameter(0, parameter1)) {
+
+        std::string filename = "/static/" + parameter1;
+        std::string filenameGzip = "/static/" + parameter1 + ".gz";
+
+        if (!SPIFFS.exists(filename.c_str()) && !SPIFFS.exists(filenameGzip.c_str())) {
+            // Send "404 Not Found" as response, as the file doesn't seem to exist
+            res->setStatusCode(404);
+            res->setStatusText("Not found");
+            res->println("404 Not Found");
+            res->printf("<p>File not found: %s</p>\n", filename.c_str());
+            return;
+        }
+
+        // Try to open the file from SPIFFS
+        File file;
+
+        if (SPIFFS.exists(filename.c_str())) {
+            file = SPIFFS.open(filename.c_str());
+            if (!file.available()) {
+                DEBUG_MSG("File not available - %s\n", filename.c_str());
+            }
+
+        } else if (SPIFFS.exists(filenameGzip.c_str())) {
+            file = SPIFFS.open(filenameGzip.c_str());
+            res->setHeader("Content-Encoding", "gzip");
+            if (!file.available()) {
+                DEBUG_MSG("File not available\n");
+            }
+        }
+
+        res->setHeader("Content-Length", httpsserver::intToString(file.size()));
+
+        bool has_set_content_type = false;
+        // Content-Type is guessed using the definition of the contentTypes-table defined above
+        int cTypeIdx = 0;
+        do {
+            if (filename.rfind(contentTypes[cTypeIdx][0]) != std::string::npos) {
+                res->setHeader("Content-Type", contentTypes[cTypeIdx][1]);
+                has_set_content_type = true;
+                break;
+            }
+            cTypeIdx += 1;
+        } while (strlen(contentTypes[cTypeIdx][0]) > 0);
+
+        if(!has_set_content_type) {
+            // Set a default content type
+            res->setHeader("Content-Type", "application/octet-stream");
+        }
+
+        // Read the file from SPIFFS and write it to the HTTP response body
+        size_t length = 0;
+        do {
+            char buffer[256];
+            length = file.read((uint8_t *)buffer, 256);
+            std::string bufferString(buffer, length);
+            res->write((uint8_t *)bufferString.c_str(), bufferString.size());
+        } while (length > 0);
+
+        file.close();
+
+        return;
+
+    } else {
+        res->println("ERROR: This should not have happened...");
+    }
+}
+
+void handleFormUpload(HTTPRequest *req, HTTPResponse *res)
+{
+    // First, we need to check the encoding of the form that we have received.
+    // The browser will set the Content-Type request header, so we can use it for that purpose.
+    // Then we select the body parser based on the encoding.
+    // Actually we do this only for documentary purposes, we know the form is going
+    // to be multipart/form-data.
+    HTTPBodyParser *parser;
+    std::string contentType = req->getHeader("Content-Type");
+
+    // The content type may have additional properties after a semicolon, for exampel:
+    // Content-Type: text/html;charset=utf-8
+    // Content-Type: multipart/form-data;boundary=------s0m3w31rdch4r4c73rs
+    // As we're interested only in the actual mime _type_, we strip everything after the
+    // first semicolon, if one exists:
+    size_t semicolonPos = contentType.find(";");
+    if (semicolonPos != std::string::npos) {
+        contentType = contentType.substr(0, semicolonPos);
+    }
+
+    // Now, we can decide based on the content type:
+    if (contentType == "multipart/form-data") {
+        parser = new HTTPMultipartBodyParser(req);
+    } else {
+        Serial.printf("Unknown POST Content-Type: %s\n", contentType.c_str());
+        return;
+    }
+
+    res->println("<html><head><meta http-equiv=\"refresh\" content=\"3;url=/static\" /><title>File "
+                 "Upload</title></head><body><h1>File Upload</h1>");
+
+    // We iterate over the fields. Any field with a filename is uploaded.
+    // Note that the BodyParser consumes the request body, meaning that you can iterate over the request's
+    // fields only a single time. The reason for this is that it allows you to handle large requests
+    // which would not fit into memory.
+    bool didwrite = false;
+
+    // parser->nextField() will move the parser to the next field in the request body (field meaning a
+    // form field, if you take the HTML perspective). After the last field has been processed, nextField()
+    // returns false and the while loop ends.
+    while (parser->nextField()) {
+        // For Multipart data, each field has three properties:
+        // The name ("name" value of the <input> tag)
+        // The filename (If it was a <input type="file">, this is the filename on the machine of the
+        //   user uploading it)
+        // The mime type (It is determined by the client. So do not trust this value and blindly start
+        //   parsing files only if the type matches)
+        std::string name = parser->getFieldName();
+        std::string filename = parser->getFieldFilename();
+        std::string mimeType = parser->getFieldMimeType();
+        // We log all three values, so that you can observe the upload on the serial monitor:
+        DEBUG_MSG("handleFormUpload: field name='%s', filename='%s', mimetype='%s'\n", name.c_str(), filename.c_str(),
+                  mimeType.c_str());
+
+        // Double check that it is what we expect
+        if (name != "file") {
+            DEBUG_MSG("Skipping unexpected field");
+            res->println("<p>No file found.</p>");
+            return;
+        }
+
+        // Double check that it is what we expect
+        if (filename == "") {
+            DEBUG_MSG("Skipping unexpected field");
+            res->println("<p>No file found.</p>");
+            return;
+        }
+
+        // SPIFFS limits the total lenth of a path + file to 31 characters.
+        if (filename.length() + 8 > 31) {
+            DEBUG_MSG("Uploaded filename too long!");
+            res->println("<p>Uploaded filename too long! Limit of 23 characters.</p>");
+            delete parser;
+            return;
+        }
+
+        // You should check file name validity and all that, but we skip that to make the core
+        // concepts of the body parser functionality easier to understand.
+        std::string pathname = "/static/" + filename;
+
+        // Create a new file on spiffs to stream the data into
+        File file = SPIFFS.open(pathname.c_str(), "w");
+        size_t fileLength = 0;
+        didwrite = true;
+
+        // With endOfField you can check whether the end of field has been reached or if there's
+        // still data pending. With multipart bodies, you cannot know the field size in advance.
+        while (!parser->endOfField()) {
+            byte buf[512];
+            size_t readLength = parser->read(buf, 512);
+            file.write(buf, readLength);
+            fileLength += readLength;
+
+            // Abort the transfer if there is less than 50k space left on the filesystem.
+            if (SPIFFS.totalBytes() - SPIFFS.usedBytes() < 51200) {
+                file.close();
+                res->println("<p>Write aborted! File is won't fit!</p>");
+
+                delete parser;
+                return;
+            }
+        }
+        file.close();
+        res->printf("<p>Saved %d bytes to %s</p>", (int)fileLength, pathname.c_str());
+    }
+    if (!didwrite) {
+        res->println("<p>Did not write any file</p>");
+    }
+    res->println("</body></html>");
+    delete parser;
+}
+
+void handle404(HTTPRequest *req, HTTPResponse *res)
+{
+
+    // Discard request body, if we received any
+    // We do this, as this is the default node and may also server POST/PUT requests
+    req->discardRequestBody();
+
+    // Set the response status
+    res->setStatusCode(404);
+    res->setStatusText("Not Found");
+
+    // Set content type of the response
+    res->setHeader("Content-Type", "text/html");
+
+    // Write a tiny HTTP page
+    res->println("<!DOCTYPE html>");
+    res->println("<html>");
+    res->println("<head><title>Not Found</title></head>");
+    res->println("<body><h1>404 Not Found</h1><p>The requested resource was not found on this server.</p></body>");
+    res->println("</html>");
 }
 
 /*
     This supports the Apple Captive Network Assistant (CNA) Portal
 */
-void handleHotspot()
+void handleHotspot(HTTPRequest *req, HTTPResponse *res)
 {
     DEBUG_MSG("Hotspot Request\n");
 
@@ -120,25 +729,105 @@ void handleHotspot()
         otherwise iOS will have trouble detecting that the connection to the SoftAP worked.
     */
 
-    String out = "";
-    // out += "Success\n";
-    out += "<meta http-equiv=\"refresh\" content=\"0;url=http://meshtastic.org/\" />\n";
-    webserver.send(200, "text/html", out);
-    return;
+    // Status code is 200 OK by default.
+    // We want to deliver a simple HTML page, so we send a corresponding content type:
+    res->setHeader("Content-Type", "text/html");
+
+    // The response implements the Print interface, so you can use it just like
+    // you would write to Serial etc.
+    res->println("<!DOCTYPE html>");
+    res->println("<meta http-equiv=\"refresh\" content=\"0;url=http://meshtastic.org/\" />\n");
 }
 
-void notifyWebUI()
+void handleAPIv1FromRadio(HTTPRequest *req, HTTPResponse *res)
 {
-    DEBUG_MSG("************ Got a message! ************\n");
-    MeshPacket &mp = devicestate.rx_text_message;
-    NodeInfo *node = nodeDB.getNode(mp.from);
-    sender = (node && node->has_user) ? node->user.long_name : "???";
 
-    static char tempBuf[256]; // mesh.options says this is MeshPacket.encrypted max_size
-    assert(mp.decoded.which_payload == SubPacket_data_tag);
-    snprintf(tempBuf, sizeof(tempBuf), "%s", mp.decoded.data.payload.bytes);
+    DEBUG_MSG("+++++++++++++++ webAPI handleAPIv1FromRadio\n");
 
-    something = tempBuf;
+    /*
+        For documentation, see:
+            https://github.com/meshtastic/Meshtastic-device/wiki/HTTP-REST-API-discussion
+            https://github.com/meshtastic/Meshtastic-device/blob/master/docs/software/device-api.md
+
+        Example:
+            http://10.10.30.198/api/v1/fromradio
+    */
+
+    // Get access to the parameters
+    ResourceParameters *params = req->getParams();
+
+    // std::string paramAll = "all";
+    std::string valueAll;
+
+    // Status code is 200 OK by default.
+    res->setHeader("Content-Type", "application/x-protobuf");
+    res->setHeader("Access-Control-Allow-Origin", "*");
+    res->setHeader("Access-Control-Allow-Methods", "PUT, GET");
+    res->setHeader("X-Protobuf-Schema", "https://raw.githubusercontent.com/meshtastic/Meshtastic-protobufs/master/mesh.proto");
+
+    uint8_t txBuf[MAX_STREAM_BUF_SIZE];
+    uint32_t len = 1;
+
+    if (params->getQueryParameter("all", valueAll)) {
+
+        // If all is ture, return all the buffers we have available
+        //   to us at this point in time.
+        if (valueAll == "true") {
+            while (len) {
+                len = webAPI.getFromRadio(txBuf);
+                res->write(txBuf, len);
+            }
+
+            // Otherwise, just return one protobuf
+        } else {
+            len = webAPI.getFromRadio(txBuf);
+            res->write(txBuf, len);
+        }
+
+        // the param "all" was not spcified. Return just one protobuf
+    } else {
+        len = webAPI.getFromRadio(txBuf);
+        res->write(txBuf, len);
+    }
+
+    DEBUG_MSG("--------------- webAPI handleAPIv1FromRadio, len %d\n", len);
+}
+
+void handleAPIv1ToRadio(HTTPRequest *req, HTTPResponse *res)
+{
+    DEBUG_MSG("+++++++++++++++ webAPI handleAPIv1ToRadio\n");
+
+    /*
+        For documentation, see:
+            https://github.com/meshtastic/Meshtastic-device/wiki/HTTP-REST-API-discussion
+            https://github.com/meshtastic/Meshtastic-device/blob/master/docs/software/device-api.md
+
+        Example:
+            http://10.10.30.198/api/v1/toradio
+    */
+
+    // Status code is 200 OK by default.
+
+    res->setHeader("Content-Type", "application/x-protobuf");
+    res->setHeader("Access-Control-Allow-Headers", "Content-Type");
+    res->setHeader("Access-Control-Allow-Origin", "*");
+    res->setHeader("Access-Control-Allow-Methods", "PUT, OPTIONS");
+    res->setHeader("X-Protobuf-Schema", "https://raw.githubusercontent.com/meshtastic/Meshtastic-protobufs/master/mesh.proto");
+
+    if (req->getMethod() == "OPTIONS") {
+        res->setStatusCode(204); // Success with no content
+        res->print("");
+        return;
+    }
+
+    byte buffer[MAX_TO_FROM_RADIO_SIZE];
+    size_t s = req->readBytes(buffer, MAX_TO_FROM_RADIO_SIZE);
+
+    DEBUG_MSG("Received %d bytes from PUT request\n", s);
+    webAPI.handleToRadio(buffer, s);
+
+    res->write(buffer, s);
+    DEBUG_MSG("--------------- webAPI handleAPIv1ToRadio\n");
 }
 
 /*
@@ -146,648 +835,77 @@ void notifyWebUI()
 
     https://tomeko.net/online_tools/cpp_text_escape.php?lang=en
 */
-void handleRoot()
+void handleRoot(HTTPRequest *req, HTTPResponse *res)
 {
+    res->setHeader("Content-Type", "text/html");
 
-    String out = "";
-    out +=
-        "<!DOCTYPE html>\n"
-        "<html lang=\"en\" >\n"
-        "<!-- Updated 20200923 - Change JSON input -->\n"
-        "<!-- Updated 20200924 - Replace FontAwesome with SVG -->\n"
-        "<head>\n"
-        "  <meta charset=\"UTF-8\">\n"
-        "  <title>Meshtastic - Chat</title>\n"
-        "  <link rel=\"stylesheet\" href=\"css/style.css\">\n"
-        "\n"
-        "</head>\n"
-        "<body>\n"
-        "<center><h1>This area is under development. Please don't file bugs.</h1></center><!-- Add SVG for Symbols -->\n"
-        "<svg aria-hidden=\"true\" style=\"position: absolute; width: 0; height: 0; overflow: hidden;\" version=\"1.1\" "
-        "xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\">\n"
-        "<defs>\n"
-        "<symbol id=\"icon-map-marker\" viewBox=\"0 0 16 28\">\n"
-        "<path d=\"M12 10c0-2.203-1.797-4-4-4s-4 1.797-4 4 1.797 4 4 4 4-1.797 4-4zM16 10c0 0.953-0.109 1.937-0.516 2.797l-5.688 "
-        "12.094c-0.328 0.688-1.047 1.109-1.797 1.109s-1.469-0.422-1.781-1.109l-5.703-12.094c-0.406-0.859-0.516-1.844-0.516-2.797 "
-        "0-4.422 3.578-8 8-8s8 3.578 8 8z\"></path>\n"
-        "</symbol>\n"
-        "<symbol id=\"icon-circle\" viewBox=\"0 0 24 28\">\n"
-        "<path d=\"M24 14c0 6.625-5.375 12-12 12s-12-5.375-12-12 5.375-12 12-12 12 5.375 12 12z\"></path>\n"
-        "</symbol>\n"
-        "</defs>\n"
-        "</svg>\n"
-        "<div class=\"grid\">\n"
-        "\t<div class=\"top\">\n"
-        "\t\t<div class=\"top-text\">Meshtastic - Chat</div>\n"
-        "\t</div>\n"
-        "\n"
-        "\t<div class=\"side clearfix\">\n"
-        "    <div class=\"channel-list\" id=\"channel-list\">\n"
-        "\t  <div class=\"side-header\">\n"
-        "\t\t<div class=\"side-text\">Users</div>\n"
-        "\t  </div>\n"
-        "      <ul class=\"list\" id='userlist-id'>\n"
-        "      </ul>\n"
-        "    </div>\n"
-        "    </div>\n"
-        "    <div class=\"content\">\n"
-        "      <div class=\"content-header clearfix\">\n"
-        "<!--      <div class=\"content-about\"> -->\n"
-        "          <div class=\"content-from\">\n"
-        "\t\t      <span class=\"content-from-highlight\" id=\"content-from-id\">All Users</span>\n"
-        "\t\t  </div>\n"
-        "<!--      </div> -->\n"
-        "      </div> <!-- end content-header -->\n"
-        "      \n"
-        "      <div class=\"content-history\" id='chat-div-id'>\n"
-        "        <ul id='chat-history-id'>\n"
-        "\t\t</ul>\n"
-        "        \n"
-        "      </div> <!-- end content-history -->\n"
-        "      \n"
-        "      <div class=\"content-message clearfix\">\n"
-        "        <textarea name=\"message-to-send\" id=\"message-to-send\" placeholder =\"Type your message\" "
-        "rows=\"3\"></textarea>\n"
-        "                \n"
-        "       \n"
-        "        <button>Send</button>\n"
-        "\n"
-        "      </div> <!-- end content-message -->\n"
-        "      \n"
-        "    </div> <!-- end content -->\n"
-        "    \n"
-        "  </div> <!-- end container -->\n"
-        "\n"
-        "<script  src=\"/scripts/script.js\"></script>\n"
-        "\n"
-        "</body>\n"
-        "</html>\n"
-        "";
-    webserver.send(200, "text/html", out);
-    return;
+    randomSeed(millis());
+
+    res->setHeader("Set-Cookie",
+                   "mt_session=" + httpsserver::intToString(random(1, 9999999)) + "; Expires=Wed, 20 Apr 2049 4:20:00 PST");
+
+    std::string cookie = req->getHeader("Cookie");
+    //String cookieString = cookie.c_str();
+    //uint8_t nameIndex = cookieString.indexOf("mt_session");
+    //DEBUG_MSG(cookie.c_str());
+
+    std::string filename = "/static/index.html";
+    std::string filenameGzip = "/static/index.html.gz";
+
+    if (!SPIFFS.exists(filename.c_str()) && !SPIFFS.exists(filenameGzip.c_str())) {
+        // Send "404 Not Found" as response, as the file doesn't seem to exist
+        res->setStatusCode(404);
+        res->setStatusText("Not found");
+        res->println("404 Not Found");
+        res->printf("<p>File not found: %s</p>\n", filename.c_str());
+        return;
+    }
+
+    // Try to open the file from SPIFFS
+    File file;
+
+    if (SPIFFS.exists(filename.c_str())) {
+        file = SPIFFS.open(filename.c_str());
+        if (!file.available()) {
+            DEBUG_MSG("File not available - %s\n", filename.c_str());
+        }
+
+    } else if (SPIFFS.exists(filenameGzip.c_str())) {
+        file = SPIFFS.open(filenameGzip.c_str());
+        res->setHeader("Content-Encoding", "gzip");
+        if (!file.available()) {
+            DEBUG_MSG("File not available\n");
+        }
+    }
+
+
+    // Read the file from SPIFFS and write it to the HTTP response body
+    size_t length = 0;
+    do {
+        char buffer[256];
+        length = file.read((uint8_t *)buffer, 256);
+        std::string bufferString(buffer, length);
+        res->write((uint8_t *)bufferString.c_str(), bufferString.size());
+    } while (length > 0);
 }
 
-void handleStyleCSS()
+void handleFavicon(HTTPRequest *req, HTTPResponse *res)
 {
-
-    String out = "";
-    out +=
-        "/* latin-ext */\n"
-        "@font-face {\n"
-        "  font-family: 'Lato';\n"
-        "  font-style: normal;\n"
-        "  font-weight: 400;\n"
-        "  src: local('Lato Regular'), local('Lato-Regular'), url(./Google.woff2) format('woff2');\n"
-        "  unicode-range: U+0100-024F, U+0259, U+1E00-1EFF, U+2020, U+20A0-20AB, U+20AD-20CF, U+2113, U+2C60-2C7F, U+A720-A7FF;\n"
-        "}\n"
-        "\n"
-        "\n"
-        "*, *:before, *:after {\n"
-        "  box-sizing: border-box;\n"
-        "}\n"
-        "\n"
-        "body {\n"
-        "  background: #C5DDEB;\n"
-        "  font: 14px/20px \"Lato\", Arial, sans-serif;\n"
-        "  padding: 40px 0;\n"
-        "  color: white;\n"
-        "}\n"
-        "\n"
-        "\n"
-        "  \n"
-        ".grid {\n"
-        "  display: grid;\n"
-        "  grid-template-columns:\n"
-        "\t1fr 4fr;\n"
-        "  grid-template-areas:\n"
-        "\t\"header header\"\n"
-        "\t\"sidebar content\";\n"
-        "  margin: 0 auto;\n"
-        "  width: 750px;\n"
-        "  background: #444753;\n"
-        "  border-radius: 5px;\n"
-        "}\n"
-        "\n"
-        ".top {grid-area: header;}\n"
-        ".side {grid-area: sidebar;}\n"
-        ".main {grid-area: content;}\n"
-        "\n"
-        ".top {\n"
-        "  border-bottom: 2px solid white;\n"
-        "}\n"
-        ".top-text {\n"
-        "  font-weight: bold;\n"
-        "  font-size: 24px;\n"
-        "  text-align: center;\n"
-        "  padding: 20px;\n"
-        "}\n"
-        "\n"
-        ".side {\n"
-        "  width: 260px;\n"
-        "  float: left;\n"
-        "}\n"
-        ".side .side-header {\n"
-        "  padding: 20px;\n"
-        "  border-bottom: 2px solid white;\n"
-        "}\n"
-        "\n"
-        ".side .side-header .side-text {\n"
-        "  padding-left: 10px;\n"
-        "  margin-top: 6px;\n"
-        "  font-size: 16px;\n"
-        "  text-align: left;\n"
-        "  font-weight: bold;\n"
-        "  \n"
-        "}\n"
-        "\n"
-        ".channel-list ul {\n"
-        "  padding: 20px;\n"
-        "  height: 570px;\n"
-        "  list-style-type: none;\n"
-        "}\n"
-        ".channel-list ul li {\n"
-        "  padding-bottom: 20px;\n"
-        "}\n"
-        "\n"
-        ".channel-list .channel-name {\n"
-        "  font-size: 20px;\n"
-        "  margin-top: 8px;\n"
-        "  padding-left: 8px;\n"
-        "}\n"
-        "\n"
-        ".channel-list .message-count {\n"
-        "  padding-left: 16px;\n"
-        "  color: #92959E;\n"
-        "}\n"
-        "\n"
-        ".icon {\n"
-        "  display: inline-block;\n"
-        "  width: 1em;\n"
-        "  height: 1em;\n"
-        "  stroke-width: 0;\n"
-        "  stroke: currentColor;\n"
-        "  fill: currentColor;\n"
-        "}\n"
-        "\n"
-        ".icon-map-marker {\n"
-        "  width: 0.5714285714285714em;\n"
-        "}\n"
-        "\n"
-        ".icon-circle {\n"
-        "  width: 0.8571428571428571em;\n"
-        "}\n"
-        "\n"
-        ".content {\n"
-        "  display: flex;\n"
-        "  flex-direction: column;\n"
-        "  flex-wrap: nowrap;\n"
-        "/* width: 490px; */\n"
-        "  float: left;\n"
-        "  background: #F2F5F8;\n"
-        "/*  border-top-right-radius: 5px;\n"
-        "  border-bottom-right-radius: 5px; */\n"
-        "  color: #434651;\n"
-        "}\n"
-        ".content .content-header {\n"
-        "  flex-grow: 0;\n"
-        "  padding: 20px;\n"
-        "  border-bottom: 2px solid white;\n"
-        "}\n"
-        "\n"
-        ".content .content-header .content-from {\n"
-        "  padding-left: 10px;\n"
-        "  margin-top: 6px;\n"
-        "  font-size: 20px;\n"
-        "  text-align: center;\n"
-        "  font-size: 16px;\n"
-        "}\n"
-        ".content .content-header .content-from .content-from-highlight {\n"
-        "  font-weight: bold;\n"
-        "}\n"
-        ".content .content-header .content-num-messages {\n"
-        "  color: #92959E;\n"
-        "}\n"
-        "\n"
-        ".content .content-history {\n"
-        "  flex-grow: 1;\n"
-        "  padding: 20px 20px 20px;\n"
-        "  border-bottom: 2px solid white;\n"
-        "  overflow-y: scroll;\n"
-        "  height: 375px;\n"
-        "}\n"
-        ".content .content-history ul {\n"
-        "  list-style-type: none;\n"
-        "  padding-inline-start: 10px;\n"
-        "}\n"
-        ".content .content-history .message-data {\n"
-        "  margin-bottom: 10px;\n"
-        "}\n"
-        ".content .content-history .message-data-time {\n"
-        "  color: #a8aab1;\n"
-        "  padding-left: 6px;\n"
-        "}\n"
-        ".content .content-history .message {\n"
-        "  color: white;\n"
-        "  padding: 8px 10px;\n"
-        "  line-height: 20px;\n"
-        "  font-size: 14px;\n"
-        "  border-radius: 7px;\n"
-        "  margin-bottom: 30px;\n"
-        "  width: 90%;\n"
-        "  position: relative;\n"
-        "}\n"
-        ".content .content-history .message:after {\n"
-        "  bottom: 100%;\n"
-        "  left: 7%;\n"
-        "  border: solid transparent;\n"
-        "  content: \" \";\n"
-        "  height: 0;\n"
-        "  width: 0;\n"
-        "  position: absolute;\n"
-        "  pointer-events: none;\n"
-        "  border-bottom-color: #86BB71;\n"
-        "  border-width: 10px;\n"
-        "  margin-left: -10px;\n"
-        "}\n"
-        ".content .content-history .my-message {\n"
-        "  background: #86BB71;\n"
-        "}\n"
-        ".content .content-history .other-message {\n"
-        "  background: #94C2ED;\n"
-        "}\n"
-        ".content .content-history .other-message:after {\n"
-        "  border-bottom-color: #94C2ED;\n"
-        "  left: 93%;\n"
-        "}\n"
-        ".content .content-message {\n"
-        "  flex-grow: 0;\n"
-        "  padding: 10px;\n"
-        "}\n"
-        ".content .content-message textarea {\n"
-        "  width: 100%;\n"
-        "  border: none;\n"
-        "  padding: 10px 10px;\n"
-        "  font: 14px/22px \"Lato\", Arial, sans-serif;\n"
-        "  margin-bottom: 10px;\n"
-        "  border-radius: 5px;\n"
-        "  resize: none;\n"
-        "}\n"
-        "\n"
-        ".content .content-message button {\n"
-        "  float: right;\n"
-        "  color: #94C2ED;\n"
-        "  font-size: 16px;\n"
-        "  text-transform: uppercase;\n"
-        "  border: none;\n"
-        "  cursor: pointer;\n"
-        "  font-weight: bold;\n"
-        "  background: #F2F5F8;\n"
-        "}\n"
-        ".content .content-message button:hover {\n"
-        "  color: #75b1e8;\n"
-        "}\n"
-        "/* Tooltip container */\n"
-        ".tooltip {\n"
-        "  color: #86BB71;\n"
-        "  position: relative;\n"
-        "  display: inline-block;\n"
-        "  border-bottom: 1px dotted black; /* If you want dots under the hoverable text */\n"
-        "}\n"
-        "/* Tooltip text */\n"
-        ".tooltip .tooltiptext {\n"
-        "  visibility: hidden;\n"
-        "  width: 120px;\n"
-        "  background-color: #444753;\n"
-        "  color: #fff;\n"
-        "  text-align: center;\n"
-        "  padding: 5px 0;\n"
-        "  border-radius: 6px;\n"
-        "   /* Position the tooltip text - see examples below! */\n"
-        "  position: absolute;\n"
-        "  z-index: 1;\n"
-        "}\n"
-        "\n"
-        "/* Show the tooltip text when you mouse over the tooltip container */\n"
-        ".tooltip:hover .tooltiptext {\n"
-        "  visibility: visible;\n"
-        "}\n"
-        "\n"
-        ".online, .offline, .me {\n"
-        "  margin-right: 3px;\n"
-        "  font-size: 10px;\n"
-        "}\n"
-        "\n"
-        ".online {\n"
-        "  color: #86BB71;\n"
-        "}\n"
-        "\n"
-        ".offline {\n"
-        "  color: #E38968;\n"
-        "}\n"
-        "\n"
-        ".me {\n"
-        "  color: #94C2ED;\n"
-        "}\n"
-        "\n"
-        ".align-left {\n"
-        "  text-align: left;\n"
-        "}\n"
-        "\n"
-        ".align-right {\n"
-        "  text-align: right;\n"
-        "}\n"
-        "\n"
-        ".float-right {\n"
-        "  float: right;\n"
-        "}\n"
-        "\n"
-        ".clearfix:after {\n"
-        "  visibility: hidden;\n"
-        "  display: block;\n"
-        "  font-size: 0;\n"
-        "  content: \" \";\n"
-        "  clear: both;\n"
-        "  height: 0;\n"
-        "}";
-
-    webserver.send(200, "text/css", out);
-    return;
+    // Set Content-Type
+    res->setHeader("Content-Type", "image/vnd.microsoft.icon");
+    // Write data from header file
+    res->write(FAVICON_DATA, FAVICON_LENGTH);
 }
 
-void handleScriptsScriptJS()
-{
-    String out = "";
-    out += "String.prototype.toHHMMSS = function () {\n"
-           "    var sec_num = parseInt(this, 10); // don't forget the second param\n"
-           "    var hours   = Math.floor(sec_num / 3600);\n"
-           "    var minutes = Math.floor((sec_num - (hours * 3600)) / 60);\n"
-           "    var seconds = sec_num - (hours * 3600) - (minutes * 60);\n"
-           "\n"
-           "    if (hours   < 10) {hours   = \"0\"+hours;}\n"
-           "    if (minutes < 10) {minutes = \"0\"+minutes;}\n"
-           "    if (seconds < 10) {seconds = \"0\"+seconds;}\n"
-           "//    return hours+':'+minutes+':'+seconds;\n"
-           "\treturn hours+'h'+minutes+'m';\n"
-           "}\n"
-           "String.prototype.padLeft = function (length, character) { \n"
-           "    return new Array(length - this.length + 1).join(character || ' ') + this; \n"
-           "};\n"
-           "\n"
-           "Date.prototype.toFormattedString = function () {\n"
-           "    return [String(this.getFullYear()).substr(2, 2),\n"
-           "\t\t\tString(this.getMonth()+1).padLeft(2, '0'),\n"
-           "            String(this.getDate()).padLeft(2, '0')].join(\"/\") + \" \" +\n"
-           "           [String(this.getHours()).padLeft(2, '0'),\n"
-           "            String(this.getMinutes()).padLeft(2, '0')].join(\":\");\n"
-           "};\n"
-           "\n"
-           "function getData(file) {\n"
-           "\tfetch(file)\n"
-           "\t.then(function (response) {\n"
-           "\t\treturn response.json();\n"
-           "\t})\n"
-           "\t.then(function (datafile) {\n"
-           "\t\tupdateData(datafile);\n"
-           "\t})\n"
-           "\t.catch(function (err) {\n"
-           "\t\tconsole.log('error: ' + err);\n"
-           "\t});\n"
-           "}\n"
-           "\t\n"
-           "function updateData(datafile) {\n"
-           "//  Update System Details\n"
-           "\tupdateSystem(datafile);\n"
-           "//\tUpdate Userlist and message count\n"
-           "\tupdateUsers(datafile);\n"
-           "//  Update Chat\n"
-           "\tupdateChat(datafile);\n"
-           "}\n"
-           "\n"
-           "function updateSystem(datafile) {\n"
-           "//  Update System Info \n"
-           "\tvar sysContainer = document.getElementById(\"content-from-id\");\n"
-           "\tvar newHTML = datafile.data.system.channel;\n"
-           "\tvar myDate = new Date( datafile.data.system.timeGPS *1000);\n"
-           "\tnewHTML += ' @' + myDate.toFormattedString();\n"
-           "\tvar newSec = datafile.data.system.timeSinceStart;\n"
-           "\tvar strsecondUp = newSec.toString();\n"
-           "\tnewHTML += ' Up:' + strsecondUp.toHHMMSS();\n"
-           "\tsysContainer.innerHTML = newHTML;\n"
-           "}\n"
-           "\n"
-           "function updateUsers(datafile) {\n"
-           "\tvar mainContainer = document.getElementById(\"userlist-id\");\n"
-           "\tvar htmlUsers = '';\n"
-           "\tvar timeBase = datafile.data.system.timeSinceStart;\n"
-           "//\tvar lookup = {};\n"
-           "    for (var i = 0; i < datafile.data.users.length; i++) {\n"
-           "        htmlUsers += formatUsers(datafile.data.users[i],timeBase);\n"
-           "\t}\n"
-           "\tmainContainer.innerHTML = htmlUsers;\n"
-           "}\n"
-           "\n"
-           "function formatUsers(user,timeBase) {\n"
-           "\tnewHTML = '<li class=\"clearfix\">';\n"
-           "    newHTML += '<div class=\"channel-name clearfix\">' + user.NameLong + '(' + user.NameShort + ')</div>';\n"
-           "    newHTML += '<div class=\"message-count clearfix\">';\n"
-           "\tvar secondsLS = timeBase - user.lastSeen;\n"
-           "\tvar strsecondsLS = secondsLS.toString();\n"
-           "\tnewHTML += '<svg class=\"icon icon-circle '+onlineStatus(secondsLS)+'\"><use "
-           "xlink:href=\"#icon-circle\"></use></svg></i>Seen: '+strsecondsLS.toHHMMSS()+' ago&nbsp;';\n"
-           "\tif (user.lat == 0 || user.lon == 0) {\n"
-           "\t\tnewHTML += '';\n"
-           "\t} else {\n"
-           "\t\tnewHTML += '<div class=\"tooltip\"><svg class=\"icon icon-map-marker\"><use "
-           "xlink:href=\"#icon-map-marker\"></use></svg><span class=\"tooltiptext\">lat:' + user.lat + ' lon:'+ user.lon+ "
-           "'</span>';\n"
-           "\t}\n"
-           "    newHTML += '</div></div>';\n"
-           "    newHTML += '</li>';\n"
-           "\treturn(newHTML);\n"
-           "}\n"
-           "\n"
-           "function onlineStatus(time) {\n"
-           "\tif (time < 3600) {\n"
-           "\t\treturn \"online\"\n"
-           "\t} else {\n"
-           "\t\treturn \"offline\"\n"
-           "\t}\n"
-           "}\n"
-           "\n"
-           "function updateChat(datafile) {\n"
-           "//  Update Chat\n"
-           "\tvar chatContainer = document.getElementById(\"chat-history-id\");\n"
-           "\tvar htmlChat = '';\n"
-           "\tvar timeBase = datafile.data.system.timeSinceStart;\n"
-           "\tfor (var i = 0; i < datafile.data.chat.length; i++) {\n"
-           "\t\thtmlChat += formatChat(datafile.data.chat[i],timeBase);\n"
-           "\t}\n"
-           "\tchatContainer.innerHTML = htmlChat;\n"
-           "\tscrollHistory();\n"
-           "}\n"
-           "\n"
-           "function formatChat(data,timeBase) {\n"
-           "\tvar secondsTS = timeBase - data.timestamp;\n"
-           "\tvar strsecondsTS = secondsTS.toString();\n"
-           "\tnewHTML = '<li class=\"clearfix\">';\n"
-           "\tif (data.local == 1) {\n"
-           "\t\tnewHTML += '<div class=\"message-data\">';\n"
-           "\t\tnewHTML += '<span class=\"message-data-name\" >' + data.NameLong + '(' + data.NameShort + ')</span>';\n"
-           "\t\tnewHTML += '<span class=\"message-data-time\" >' + strsecondsTS.toHHMMSS() + ' ago</span>';\n"
-           "\t\tnewHTML += '</div>';\n"
-           "\t\tnewHTML += '<div class=\"message my-message\">' + data.chatLine + '</div>';\n"
-           "\t} else {\n"
-           "\t\tnewHTML += '<div class=\"message-data align-right\">';\n"
-           "\t\tnewHTML += '<span class=\"message-data-time\" >' + strsecondsTS.toHHMMSS() + ' ago</span> &nbsp; &nbsp;';\n"
-           "\t\tnewHTML += '<span class=\"message-data-name\" >' + data.NameLong + '(' + data.NameShort + ')</span>';\n"
-           "//\t\tnewHTML += '<i class=\"fa fa-circle online\"></i>';\n"
-           "\t\tnewHTML += '</div>';\n"
-           "\t\tnewHTML += '<div class=\"message other-message float-right\">' + data.chatLine + '</div>';\n"
-           "\t}\n"
-           "\n"
-           "    newHTML += '</li>';\n"
-           "\treturn(newHTML);\t\n"
-           "}\n"
-           "\n"
-           "function scrollHistory() {\n"
-           "\tvar chatContainer = document.getElementById(\"chat-div-id\");\n"
-           "\tchatContainer.scrollTop = chatContainer.scrollHeight;\n"
-           "}\n"
-           "\n"
-           "\n"
-           "getData('/json/chat/history/dummy');\n"
-           "\n"
-           "\n"
-           "//window.onload=function(){\n"
-           "//\talert('onload');\n"
-           "//  Async - Run scroll 0.5sec after onload event\n"
-           "//\tsetTimeout(scrollHistory(),500);\n"
-           "// }";
 
-    webserver.send(200, "text/javascript", out);
-    return;
+void replaceAll(std::string &str, const std::string &from, const std::string &to)
+{
+    if (from.empty())
+        return;
+    size_t start_pos = 0;
+    while ((start_pos = str.find(from, start_pos)) != std::string::npos) {
+        str.replace(start_pos, from.length(), to);
+        start_pos += to.length(); // In case 'to' contains 'from', like replacing 'x' with 'yx'
+    }
 }
 
-void handleJSONChatHistoryDummy()
-{
-    String out = "";
-    out += "{\n"
-           "\t\"data\": {\n"
-           "\t\t\"system\": {\n"
-           "\t\t\t\"timeSinceStart\": 3213544,\n"
-           "\t\t\t\"timeGPS\": 1600830985,\n"
-           "\t\t\t\"channel\": \"ourSecretPlace\"\n"
-           "\t\t},\n"
-           "\t\t\"users\": [{\n"
-           "\t\t\t\t\"NameShort\": \"J\",\n"
-           "\t\t\t\t\"NameLong\": \"John\",\n"
-           "\t\t\t\t\"lastSeen\": 3207544,\n"
-           "\t\t\t\t\"lat\" : -2.882243,\n"
-           "\t\t\t\t\"lon\" : -111.038580\n"
-           "\t\t\t},\n"
-           "\t\t\t{\n"
-           "\t\t\t\t\"NameShort\": \"D\",\n"
-           "\t\t\t\t\"NameLong\": \"David\",\n"
-           "\t\t\t\t\"lastSeen\": 3212544,\n"
-           "\t\t\t\t\"lat\" : -12.24452,\n"
-           "\t\t\t\t\"lon\" : -61.87351\n"
-           "\t\t\t},\n"
-           "\t\t\t{\n"
-           "\t\t\t\t\"NameShort\": \"P\",\n"
-           "\t\t\t\t\"NameLong\": \"Peter\",\n"
-           "\t\t\t\t\"lastSeen\": 3213444,\n"
-           "\t\t\t\t\"lat\" : 0,\n"
-           "\t\t\t\t\"lon\" : 0\n"
-           "\t\t\t},\n"
-           "\t\t\t{\n"
-           "\t\t\t\t\"NameShort\": \"M\",\n"
-           "\t\t\t\t\"NameLong\": \"Mary\",\n"
-           "\t\t\t\t\"lastSeen\": 3211544,\n"
-           "\t\t\t\t\"lat\" : 16.45478,\n"
-           "\t\t\t\t\"lon\" : 11.40166\n"
-           "\t\t\t}\n"
-           "\t\t],\n"
-           "\t\t\"chat\": [{\n"
-           "\t\t\t\t\"local\": 0,\n"
-           "\t\t\t\t\"NameShort\": \"J\",\n"
-           "\t\t\t\t\"NameLong\": \"John\",\n"
-           "\t\t\t\t\"chatLine\": \"Hello\",\n"
-           "\t\t\t\t\"timestamp\" : 3203544\n"
-           "\t\t\t},\n"
-           "\t\t\t{\n"
-           "\t\t\t\t\"local\": 0,\n"
-           "\t\t\t\t\"NameShort\": \"D\",\n"
-           "\t\t\t\t\"NameLong\": \"David\",\n"
-           "\t\t\t\t\"chatLine\": \"Hello There\",\n"
-           "\t\t\t\t\"timestamp\" : 3204544\n"
-           "\t\t\t},\n"
-           "\t\t\t{\n"
-           "\t\t\t\t\"local\": 0,\n"
-           "\t\t\t\t\"NameShort\": \"J\",\n"
-           "\t\t\t\t\"NameLong\": \"John\",\n"
-           "\t\t\t\t\"chatLine\": \"Where you been?\",\n"
-           "\t\t\t\t\"timestamp\" : 3205544\n"
-           "\t\t\t},\n"
-           "\t\t\t{\n"
-           "\t\t\t\t\"local\": 0,\n"
-           "\t\t\t\t\"NameShort\": \"D\",\n"
-           "\t\t\t\t\"NameLong\": \"David\",\n"
-           "\t\t\t\t\"chatLine\": \"I was on Channel 2\",\n"
-           "\t\t\t\t\"timestamp\" : 3206544\n"
-           "\t\t\t},\n"
-           "\t\t\t{\n"
-           "\t\t\t\t\"local\": 0,\n"
-           "\t\t\t\t\"NameShort\": \"J\",\n"
-           "\t\t\t\t\"NameLong\": \"John\",\n"
-           "\t\t\t\t\"chatLine\": \"With Mary again?\",\n"
-           "\t\t\t\t\"timestamp\" : 3207544\n"
-           "\t\t\t},\n"
-           "\t\t\t{\n"
-           "\t\t\t\t\"local\": 0,\n"
-           "\t\t\t\t\"NameShort\": \"D\",\n"
-           "\t\t\t\t\"NameLong\": \"David\",\n"
-           "\t\t\t\t\"chatLine\": \"She's better looking than you\",\n"
-           "\t\t\t\t\"timestamp\" : 3208544\n"
-           "\t\t\t},\n"
-           "\t\t\t{\n"
-           "\t\t\t\t\"local\": 0,\n"
-           "\t\t\t\t\"NameShort\": \"M\",\n"
-           "\t\t\t\t\"NameLong\": \"Mary\",\n"
-           "\t\t\t\t\"chatLine\": \"Well, Hi\",\n"
-           "\t\t\t\t\"timestamp\" : 3209544\n"
-           "\t\t\t},\n"
-           "\t\t\t{\n"
-           "\t\t\t\t\"local\": 0,\n"
-           "\t\t\t\t\"NameShort\": \"D\",\n"
-           "\t\t\t\t\"NameLong\": \"David\",\n"
-           "\t\t\t\t\"chatLine\": \"You're Here\",\n"
-           "\t\t\t\t\"timestamp\" : 3210544\n"
-           "\t\t\t},\n"
-           "\t\t\t{\n"
-           "\t\t\t\t\"local\": 0,\n"
-           "\t\t\t\t\"NameShort\": \"M\",\n"
-           "\t\t\t\t\"NameLong\": \"Mary\",\n"
-           "\t\t\t\t\"chatLine\": \"Wanted to say Howdy.\",\n"
-           "\t\t\t\t\"timestamp\" : 3211544\n"
-           "\t\t\t},\n"
-           "\t\t\t{\n"
-           "\t\t\t\t\"local\": 0,\n"
-           "\t\t\t\t\"NameShort\": \"D\",\n"
-           "\t\t\t\t\"NameLong\": \"David\",\n"
-           "\t\t\t\t\"chatLine\": \"Better come down and visit sometime\",\n"
-           "\t\t\t\t\"timestamp\" : 3212544\n"
-           "\t\t\t},\n"
-           "\t\t\t{\n"
-           "\t\t\t\t\"local\": 1,\n"
-           "\t\t\t\t\"NameShort\": \"P\",\n"
-           "\t\t\t\t\"NameLong\": \"Peter\",\n"
-           "\t\t\t\t\"chatLine\": \"Where is everybody?\",\n"
-           "\t\t\t\t\"timestamp\" : 3213444\n"
-           "\t\t\t}\n"
-           "\t\t]\n"
-           "\t}\n"
-           "}";
-
-    webserver.send(200, "application/json", out);
-    return;
-}

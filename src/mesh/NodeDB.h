@@ -33,7 +33,6 @@ class NodeDB
   public:
     bool updateGUI = false;            // we think the gui should definitely be redrawn, screen will clear this once handled
     NodeInfo *updateGUIforNode = NULL; // if currently showing this node, we think you should update the GUI
-    bool updateTextMessage = false;    // if true, the GUI should show a new text message
     Observable<const meshtastic::NodeStatus *> newStatus;
 
     /// don't do mesh based algoritm for node id assignment (initially)
@@ -57,6 +56,14 @@ class NodeDB
     /// given a subpacket sniffed from the network, update our DB state
     /// we updateGUI and updateGUIforNode if we think our this change is big enough for a redraw
     void updateFrom(const MeshPacket &p);
+
+    /** Update position info for this node based on received position data
+     */
+    void updatePosition(uint32_t nodeId, const Position &p);
+
+    /** Update user info for this node based on received user data
+     */
+    void updateUser(uint32_t nodeId, const User &p);
 
     /// @return our node number
     NodeNum getNodeNum() { return myNodeInfo.my_node_num; }
@@ -144,11 +151,18 @@ const char *getChannelName();
 
 PREF_GET(send_owner_interval, 4)
 PREF_GET(position_broadcast_secs, 15 * 60)
-PREF_GET(wait_bluetooth_secs, 120)
+
+// Each time we wake into the DARK state allow 1 minute to send and receive BLE packets to the phone
+PREF_GET(wait_bluetooth_secs, 60)
+
 PREF_GET(screen_on_secs, 60)
 PREF_GET(mesh_sds_timeout_secs, 2 * 60 * 60)
 PREF_GET(phone_sds_timeout_sec, 2 * 60 * 60)
 PREF_GET(sds_secs, 365 * 24 * 60 * 60)
-PREF_GET(ls_secs, 60 * 60)
+
+// We default to sleeping (with bluetooth off for 5 minutes at a time).  This seems to be a good tradeoff between
+// latency for the user sending messages and power savings because of not having to run (expensive) ESP32 bluetooth
+PREF_GET(ls_secs, 5 * 60)
+
 PREF_GET(phone_timeout_secs, 15 * 60)
 PREF_GET(min_wake_secs, 10)

@@ -6,6 +6,8 @@
 
 #ifdef USE_SH1106
 #include <SH1106Wire.h>
+#elif defined(USE_ST7567)
+#include <ST7567Wire.h>
 #else
 #include <SSD1306Wire.h>
 #endif
@@ -18,6 +20,11 @@
 #include "concurrency/OSThread.h"
 #include "power.h"
 #include <string>
+
+// 0 to 255, though particular variants might define different defaults
+#ifndef BRIGHTNESS_DEFAULT
+#define BRIGHTNESS_DEFAULT 150
+#endif
 
 namespace graphics
 {
@@ -70,6 +77,8 @@ class Screen : public concurrency::OSThread
         CallbackObserver<Screen, const meshtastic::Status *>(this, &Screen::handleStatusUpdate);
     CallbackObserver<Screen, const meshtastic::Status *> nodeStatusObserver =
         CallbackObserver<Screen, const meshtastic::Status *>(this, &Screen::handleStatusUpdate);
+    CallbackObserver<Screen, const MeshPacket *> textMessageObserver =
+        CallbackObserver<Screen, const MeshPacket *>(this, &Screen::handleTextMessage);
 
   public:
     Screen(uint8_t address, int sda = -1, int scl = -1);
@@ -92,12 +101,18 @@ class Screen : public concurrency::OSThread
             enqueueCmd(ScreenCmd{.cmd = on ? Cmd::SET_ON : Cmd::SET_OFF});
     }
 
+    /**
+     * Prepare the display for the unit going to the lowest power mode possible.  Most screens will just 
+     * poweroff, but eink screens will show a "I'm sleeping" graphic, possibly with a QR code
+     */
+    void doDeepSleep();
+
     /// Handles a button press.
     void onPress() { enqueueCmd(ScreenCmd{.cmd = Cmd::ON_PRESS}); }
 
     // Implementation to Adjust Brightness
     void adjustBrightness();
-    uint8_t brightness = 150;
+    uint8_t brightness = BRIGHTNESS_DEFAULT;
 
     /// Starts showing the Bluetooth PIN screen.
     //
@@ -179,6 +194,10 @@ class Screen : public concurrency::OSThread
     DebugInfo *debug_info() { return &debugInfo; }
 
     int handleStatusUpdate(const meshtastic::Status *arg);
+    int handleTextMessage(const MeshPacket *arg);
+
+    /// Used to force (super slow) eink displays to draw critical frames
+    void forceDisplay();
 
   protected:
     /// Updates the UI.
@@ -216,6 +235,9 @@ class Screen : public concurrency::OSThread
     /// Rebuilds our list of frames (screens) to default ones.
     void setFrames();
 
+    /// Try to start drawing ASAP
+    void setFastFramerate();
+
     /// Called when debug screen is to be drawn, calls through to debugInfo.drawFrame.
     static void drawDebugInfoTrampoline(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y);
 
@@ -244,6 +266,8 @@ class Screen : public concurrency::OSThread
     EInkDisplay dispdev;
 #elif defined(USE_SH1106)
     SH1106Wire dispdev;
+#elif defined(USE_ST7567)
+    ST7567Wire dispdev;
 #else
     SSD1306Wire dispdev;
 #endif
