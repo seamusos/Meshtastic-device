@@ -14,6 +14,8 @@ class SensorPlugin : public SinglePortPlugin, private concurrency::OSThread
      */
     SensorPlugin(); //: SinglePortPlugin("sensor", PortNum_PRIVATE_APP) {}
 
+    void sendMessage();
+
   protected:
 
     /** Called to handle a particular incoming message
@@ -24,3 +26,5 @@ class SensorPlugin : public SinglePortPlugin, private concurrency::OSThread
 
     virtual int32_t runOnce();
 };
+
+extern SensorPlugin sensorPlugin;

@@ -237,28 +237,28 @@ int MeshService::onGPSChanged(const meshtastic::GPSStatus *unused)
     return 0;
 }
 
-void MeshService::sendTextMessage(uint8_t *array, size_t size)
-{
-    // uint8_t data[] = "AB";
+// void MeshService::sendTextMessage(uint8_t *array, size_t size)
+// {
+//     // uint8_t data[] = "AB";
     
-    //Allocate Mesh packet
-    MeshPacket *p = router->allocForSending();
-    p->decoded.which_payload = SubPacket_data_tag;
+//     //Allocate Mesh packet
+//     MeshPacket *p = router->allocForSending();
+//     p->decoded.which_payload = SubPacket_data_tag;
 
-    p->decoded.data.typ = Data_Type_CLEAR_TEXT; //Modify for different types of data
-    // p->decoded.data.payload
-    p->decoded.data.payload.size = size;
+//     p->decoded.data.typ = Data_Type_CLEAR_TEXT; //Modify for different types of data
+//     // p->decoded.data.payload
+//     p->decoded.data.payload.size = size;
 
-    DEBUG_PORT.print("\n Size of payload: ");
-    DEBUG_PORT.print(size);
+//     DEBUG_PORT.print("\n Size of payload: ");
+//     DEBUG_PORT.print(size);
 
-    DEBUG_PORT.print("\n In message: ");
-    for (size_t i = 0; i <= size - 1; i++)
-    {
-        p->decoded.data.payload.bytes[i] = array[i];
-        DEBUG_PORT.print(array[i]);
-    }   
+//     DEBUG_PORT.print("\n In message: ");
+//     for (size_t i = 0; i <= size - 1; i++)
+//     {
+//         p->decoded.data.payload.bytes[i] = array[i];
+//         DEBUG_PORT.print(array[i]);
+//     }   
 
-    sendToMesh(p);
-    // router.sendLocal(p);
-}
+//     sendToMesh(p);
+//     // router.sendLocal(p);
+// }

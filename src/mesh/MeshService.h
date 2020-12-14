@@ -75,7 +75,7 @@ class MeshService
     /// sends our owner
     void sendNetworkPing(NodeNum dest, bool wantReplies = false);
 
-    void sendTextMessage(uint8_t *array, size_t size);
+    // void sendTextMessage(uint8_t *array, size_t size);
 
     /// Send a packet into the mesh - note p must have been allocated from packetPool.  We will return it to that pool after
     /// sending. This is the ONLY function you should use for sending messages into the mesh, because it also updates the nodedb
