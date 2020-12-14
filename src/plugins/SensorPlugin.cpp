@@ -18,15 +18,15 @@ SensorPlugin::SensorPlugin()
 {
 }
 
-void SensorPlugin::sendMessage(){
+void SensorPlugin::sendMessage(const char * message, size_t size){
     DEBUG_MSG("Sending Message!\n");
     screen->print("Sending Message!\n");
 
-    const char *message = "Hello there";
+    // const char *message = "Hello there";
 
     auto packet = allocDataPacket();
 
-    packet->decoded.data.payload.size = strlen(message);
+    packet->decoded.data.payload.size = size;
 
     memcpy(packet->decoded.data.payload.bytes, message, packet->decoded.data.payload.size);
 
@@ -53,7 +53,11 @@ int32_t SensorPlugin::runOnce() {
     // {
     //     /* code */
     // }
-    sensorPlugin.sendMessage();
+
+    
+    const char *message = "Hello there";
+
+    sensorPlugin.sendMessage(message, strlen(message));
     
 
     return 10000;

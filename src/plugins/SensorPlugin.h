@@ -14,7 +14,7 @@ class SensorPlugin : public SinglePortPlugin, private concurrency::OSThread
      */
     SensorPlugin(); //: SinglePortPlugin("sensor", PortNum_PRIVATE_APP) {}
 
-    void sendMessage();
+    void sendMessage(const char * message, size_t size);
 
   protected:
 
