@@ -39,10 +39,6 @@
 
 #include <plugins/SensorPlugin.h>
 
-// #include <Adafruit_Sensor.h>
-// #include "Adafruit_BME680.h"
-// #include "Adafruit_LC709203F.h"
-// #include <CayenneLPP.h>
 
 using namespace concurrency;
 
@@ -553,84 +549,7 @@ void loop()
     // axpDebugOutput.loop();
 
     /************* Sensor Testing **************/
-    // if((millis() - lastTime) >= 10000)
-    // {
-
-    //     sensorPlugin.sendMessage();
-
-    //     char string[] = "Hello There";
-
-    //     uint8_t *payload = (uint8_t *)string;
-
-
-
-
-
-    //     // service.sendTextMessage(payload ,sizeof(string));
-
-        
-    //     // if (! bme.performReading()) {
-    //     //     DEBUG_PORT.println("Failed to perform reading :(");
-    //     //     return;
-    //     // }
-
-    //     // float cellVoltage = lc.cellVoltage();
-    //     // float batPercentage = lc.cellPercent();
-    //     float temperature = 25.05;
-    //     float humidity = 60.0;
-    //     float pressure = 1012.00;
-
-    //     lpp.reset();
-    //     lpp.addTemperature(1, temperature);
-    //     lpp.addRelativeHumidity(2, humidity);
-    //     // lpp.addBarometricPressure(3, pressure);
-
-    //     // lpp.addPercentage(4, batPercentage);
-
-    //     uint8_t buffer[lpp.getSize()];
-
-    //     lpp.copy(buffer);
-
-    //     DEBUG_PORT.print("Binary Enocded Packet = ");
-    //     // for (size_t i = 0; i < sizeof(buffer); i++)
-    //     // {
-    //     //     /* code */
-    //     //     DEBUG_PORT.print(buffer[i]);
-    //     // }
-
-    //     Serial2.write(buffer, lpp.getSize());
-        
-
-    //     // DEBUG_PORT.write(lpp.getBuffer(), lpp.getSize());
-
-    //     // lpp.decode(lpp.getBuffer(), lpp.getSize(), root);
-    //     // serializeJsonPretty(root, DEBUG_PORT);
-    //     // DEBUG_PORT.println();
-
-    //     service.sendTextMessage(lpp.getBuffer() ,lpp.getSize());
-
-
-        
-
-
-    //     // strcat(data.dataString, ", bat: ");
-    //     // test = String(batPercentage);
-    //     // strcat(data.dataString, test.c_str());
-
-    //     // sprintf(dataString, "Counter = %c", counter);
-
-    //     // service.sendTextMessage(data.sendString, sizeof(data.dataString));
-    //     lastTime = millis();
-    // }
-
-    // if(buttonflag > 0)
-    // {
-    //     counter++;
-    //     uint8_t dataString[] = "Button Press";
-    //     // sprintf(dataString, "Counter = %c", counter);
-    //     service.sendTextMessage(dataString, sizeof(dataString));
-    //     buttonflag--;
-    // }
+    
 
 #ifdef DEBUG_PORT
     DEBUG_PORT.loop(); // Send/receive protobufs over the serial port
